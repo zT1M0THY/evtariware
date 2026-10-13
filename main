@@ -1,0 +1,756 @@
+--[[
+    Evtariware - Functional AutoParry & Advanced Timing Builder
+    UI Library: LinoriaLib
+]]
+
+local repo = 'https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/'
+local Library = loadstring(game:HttpGet(repo .. 'Library.lua'))()
+local ThemeManager = loadstring(game:HttpGet(repo .. 'addons/ThemeManager.lua'))()
+local SaveManager = loadstring(game:HttpGet(repo .. 'addons/SaveManager.lua'))()
+
+-- Services
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ==========================================
+-- FILE SYSTEM SETUP
+-- ==========================================
+local MainFolder = "Evtariware"
+local TimingsFolder = MainFolder .. "/Timings"
+local ConfigsFolder = MainFolder .. "/Configs"
+
+if not isfolder(MainFolder) then makefolder(MainFolder) end
+if not isfolder(TimingsFolder) then makefolder(TimingsFolder) end
+if not isfolder(ConfigsFolder) then makefolder(ConfigsFolder) end
+
+-- ==========================================
+-- STATE
+-- ==========================================
+getgenv().ParryConfig = {
+    Enabled = false,
+    PingCompensation = false,
+    GlobalDelayOffset = 0,
+    MaxDistance = 20,
+    RollOnParryCooldown = false,
+    RollIfBehind = false,
+    AutoRollCancel = false,
+    RollCancelDelay = 0.2,
+    Profiles = {} -- [AnimId] = { Name, Action, Delay, HitboxSize, Enabled }
+}
+
+local LoggedAnimations = {}
+local loggingEnabled = true
+
+local localPreviewTrack = nil
+
+local animValueMap = {}
+local loadedTimingMap = {}
+
+-- Cooldown heuristics
+local lastParryPress = 0
+local PARRY_COOLDOWN_TIME = 0.5
+
+-- Separate key press trackers so roll can't block parry
+local lastParryKey = 0
+local lastRollKey = 0
+local PARRY_KEY_COOLDOWN = 0.08
+local ROLL_KEY_COOLDOWN = 0.08
+
+-- ==========================================
+-- HELPERS
+-- ==========================================
+local function GetCleanAnimId(animIdStr)
+    if not animIdStr then return "" end
+    return tostring(animIdStr):match("%d+") or tostring(animIdStr)
+end
+
+local function GetPing()
+    local ok, ping = pcall(function()
+        return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and tonumber(ping) then return tonumber(ping) end
+    return 0
+end
+
+local function IsOpponentBehind(enemyChar)
+    local myChar = LocalPlayer.Character
+    if not myChar then return false end
+
+    local myHRP = myChar:FindFirstChild("HumanoidRootPart")
+    local enemyHRP = enemyChar and enemyChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP or not enemyHRP then return false end
+
+    local myLook = myHRP.CFrame.LookVector
+    local toEnemy = enemyHRP.Position - myHRP.Position
+    toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
+    if toEnemy.Magnitude < 0.01 then return false end
+    toEnemy = toEnemy.Unit
+
+    return myLook:Dot(toEnemy) < 0
+end
+
+-- ==========================================
+-- LOCAL PLAYER CHARACTER ANIMATION PREVIEW
+-- ==========================================
+local function StopLocalCharacterAnimation()
+    if localPreviewTrack then
+        pcall(function() localPreviewTrack:Stop() end)
+        pcall(function() localPreviewTrack:Destroy() end)
+        localPreviewTrack = nil
+    end
+end
+
+local function PlayAnimationOnLocalCharacter(animId)
+    StopLocalCharacterAnimation()
+
+    if not animId or animId == "" then
+        Library:Notify("No Animation ID selected!", 3)
+        return
+    end
+
+    local char = LocalPlayer.Character
+    if not char then
+        Library:Notify("Character not found!", 3)
+        return
+    end
+
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not animator then
+        Library:Notify("Animator not found on Character!", 3)
+        return
+    end
+
+    local cleanId = GetCleanAnimId(animId)
+    local animObject = Instance.new("Animation")
+    animObject.AnimationId = "rbxassetid://" .. cleanId
+
+    local success, track = pcall(function()
+        return animator:LoadAnimation(animObject)
+    end)
+
+    if success and track then
+        localPreviewTrack = track
+        track.Looped = false
+        track:Play()
+        Library:Notify("Playing animation " .. cleanId .. " on your character!", 3)
+    else
+        Library:Notify("Failed to load animation onto your character!", 3)
+    end
+end
+
+-- ==========================================
+-- TIMING FILE SYSTEM
+-- ==========================================
+local function SaveTimingFile(timingName, animId, action, delay, hitbox)
+    if not timingName or timingName == "" then return false, "No timing name" end
+    if not animId or animId == "" then return false, "No animation ID" end
+
+    local data = {
+        AnimId = animId,
+        Name = timingName,
+        Action = action,
+        Delay = delay,
+        HitboxSize = hitbox,
+        Enabled = true
+    }
+
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if not ok then return false, "Encode failed" end
+
+    local ok2 = pcall(function()
+        writefile(TimingsFolder .. "/" .. timingName .. ".json", encoded)
+    end)
+    if not ok2 then return false, "Write failed" end
+
+    return true
+end
+
+local function LoadTimingFile(timingName)
+    local path = TimingsFolder .. "/" .. timingName .. ".json"
+    if not isfile(path) then return nil end
+
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+    if not ok or not decoded or not decoded.AnimId then return nil end
+
+    getgenv().ParryConfig.Profiles[decoded.AnimId] = {
+        Name = decoded.Name or timingName,
+        Action = decoded.Action or "Parry",
+        Delay = decoded.Delay or 0.15,
+        HitboxSize = decoded.HitboxSize or 1,
+        Enabled = true
+    }
+    return decoded
+end
+
+local function DeleteTimingFile(timingName)
+    local path = TimingsFolder .. "/" .. timingName .. ".json"
+    if isfile(path) then
+        pcall(function() delfile(path) end)
+        return true
+    end
+    return false
+end
+
+local function ListTimingFiles()
+    local list = {}
+    if isfolder(TimingsFolder) then
+        for _, file in ipairs(listfiles(TimingsFolder)) do
+            local name = file:match("([^/\\]+)%.json$")
+            if name then table.insert(list, name) end
+        end
+    end
+    if #list == 0 then table.insert(list, "None") end
+    return list
+end
+
+local function ListLoadedTimings()
+    local list = {}
+    for animId, profile in pairs(getgenv().ParryConfig.Profiles) do
+        local label = string.format("%s [%s]", profile.Name or "Unnamed", animId)
+        table.insert(list, label)
+    end
+    if #list == 0 then table.insert(list, "None") end
+    return list
+end
+
+-- Auto-load every timing file into runtime
+local function LoadAllTimings()
+    local count = 0
+    if isfolder(TimingsFolder) then
+        for _, file in ipairs(listfiles(TimingsFolder)) do
+            local name = file:match("([^/\\]+)%.json$")
+            if name then
+                if LoadTimingFile(name) then
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return count
+end
+
+-- ==========================================
+-- CORE ACTIONS
+-- ==========================================
+local function SendParryKey()
+    local now = os.clock()
+    if now - lastParryKey < PARRY_KEY_COOLDOWN then return false end
+    lastParryKey = now
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+    task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+    return true
+end
+
+local function SendRollKey()
+    local now = os.clock()
+    if now - lastRollKey < ROLL_KEY_COOLDOWN then return false end
+    lastRollKey = now
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
+    task.wait(0.05)
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+    return true
+end
+
+local function ExecuteParry()
+    local sent = SendParryKey()
+    if sent then
+        lastParryPress = os.clock()
+    end
+    return sent
+end
+
+local function ExecuteRoll()
+    return SendRollKey()
+end
+
+-- M2 cancel — try executor's mouse2click, then two VIM fallbacks
+local function ExecuteM2Cancel()
+    if type(mouse2click) == "function" then
+        local ok = pcall(mouse2click)
+        if ok then return end
+    end
+
+    local loc = UserInputService:GetMouseLocation()
+
+    local ok1 = pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, true, game, 1)
+        task.wait(0.03)
+        VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, false, game, 1)
+    end)
+    if ok1 then return end
+
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(0, 0, 2, true, game, 0)
+        task.wait(0.03)
+        VirtualInputManager:SendMouseButtonEvent(0, 0, 2, false, game, 0)
+    end)
+end
+
+local function ExecuteAction(action)
+    if action == "Roll" then
+        ExecuteRoll()
+        return "Roll"
+    else
+        ExecuteParry()
+        return "Parry"
+    end
+end
+
+-- ==========================================
+-- ANIMATION LOGGER & LISTENER
+-- ==========================================
+local function OnAnimationPlayed(humanoid, animationTrack)
+    if not loggingEnabled then return end
+    if not humanoid or not animationTrack then return end
+    local character = humanoid.Parent
+    if not character or character == LocalPlayer.Character then return end
+
+    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        local hrp = LocalPlayer.Character.HumanoidRootPart
+        local enemyHrp = character:FindFirstChild("HumanoidRootPart")
+        if enemyHrp and (hrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.MaxDistance then
+            return
+        end
+    end
+
+    local rawAnimId = tostring(animationTrack.Animation.AnimationId)
+    local cleanId = GetCleanAnimId(rawAnimId)
+    local animName = (animationTrack.Name ~= "" and animationTrack.Name) or ("ID: " .. cleanId)
+
+    if not LoggedAnimations[cleanId] then
+        LoggedAnimations[cleanId] = { Name = animName, Id = cleanId, Count = 1 }
+    else
+        LoggedAnimations[cleanId].Count = LoggedAnimations[cleanId].Count + 1
+    end
+
+    local profile = getgenv().ParryConfig.Profiles[cleanId]
+    if profile and profile.Enabled and getgenv().ParryConfig.Enabled then
+        task.spawn(function()
+            local delay = profile.Delay + (getgenv().ParryConfig.GlobalDelayOffset / 1000)
+            if getgenv().ParryConfig.PingCompensation then
+                delay = delay - (GetPing() / 1000)
+            end
+            if delay < 0 then delay = 0 end
+            task.wait(delay)
+
+            local action = profile.Action or "Parry"
+
+            if action == "Parry" and getgenv().ParryConfig.RollIfBehind then
+                if IsOpponentBehind(character) then
+                    action = "Roll"
+                end
+            end
+
+            if action == "Parry" and getgenv().ParryConfig.RollOnParryCooldown then
+                if (os.clock() - lastParryPress) < PARRY_COOLDOWN_TIME then
+                    action = "Roll"
+                end
+            end
+
+            local performed = ExecuteAction(action)
+
+            -- Auto Roll Cancel: right click after an auto-roll
+            if performed == "Roll" and getgenv().ParryConfig.AutoRollCancel then
+                task.spawn(function()
+                    task.wait(getgenv().ParryConfig.RollCancelDelay)
+                    ExecuteM2Cancel()
+                end)
+            end
+        end)
+    end
+end
+
+-- Connection hooks
+local function HookCharacter(player, char)
+    local humanoid = char:WaitForChild("Humanoid", 5)
+    if not humanoid then return end
+    local animator = humanoid:WaitForChild("Animator", 5)
+    if not animator then return end
+    animator.AnimationPlayed:Connect(function(track)
+        OnAnimationPlayed(humanoid, track)
+    end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+        if player.Character then HookCharacter(player, player.Character) end
+        player.CharacterAdded:Connect(function(char) HookCharacter(player, char) end)
+    end
+end
+
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(char)
+        HookCharacter(player, char)
+    end)
+end)
+
+-- ==========================================
+-- AUTO-LOAD TIMINGS (before UI so dropdowns are populated)
+-- ==========================================
+local loadedCount = LoadAllTimings()
+
+-- ==========================================
+-- UI CONSTRUCTION
+-- ==========================================
+local Window = Library:CreateWindow({
+    Title = 'Evtariware',
+    Center = true,
+    AutoShow = true,
+    TabPadding = 8,
+    MenuFadeTime = 0.2
+})
+
+local Tabs = {
+    Combat   = Window:AddTab('Combat'),
+    Builder  = Window:AddTab('Builder'),
+    Timings  = Window:AddTab('Timings'),
+    Settings = Window:AddTab('Settings')
+}
+
+-- --- TAB 1: COMBAT ---
+local AssistanceBox = Tabs.Combat:AddLeftGroupbox('Assistance')
+
+AssistanceBox:AddToggle('AutoDefenseMaster', {
+    Text = 'Auto Defense',
+    Default = false,
+    Callback = function(value)
+        getgenv().ParryConfig.Enabled = value
+    end
+})
+
+AssistanceBox:AddToggle('RollOnCooldownToggle', {
+    Text = 'Roll If Parry On Cooldown',
+    Default = false,
+    Callback = function(value)
+        getgenv().ParryConfig.RollOnParryCooldown = value
+    end
+})
+
+AssistanceBox:AddToggle('RollIfBehindToggle', {
+    Text = 'Roll If Opponent Is Behind You',
+    Default = false,
+    Callback = function(value)
+        getgenv().ParryConfig.RollIfBehind = value
+    end
+})
+
+AssistanceBox:AddToggle('AutoRollCancelToggle', {
+    Text = 'Auto Roll Cancel',
+    Default = false,
+    Callback = function(value)
+        getgenv().ParryConfig.AutoRollCancel = value
+    end
+})
+
+AssistanceBox:AddSlider('RollCancelDelaySlider', {
+    Text = 'Roll Cancel Delay (Seconds)',
+    Default = 0.2,
+    Min = 0.0,
+    Max = 1.0,
+    Rounding = 3,
+    Callback = function(value)
+        getgenv().ParryConfig.RollCancelDelay = value
+    end
+})
+
+local GlobalBox = Tabs.Combat:AddRightGroupbox('Global Parameters')
+
+GlobalBox:AddToggle('PingCompensationToggle', {
+    Text = 'Ping Compensation',
+    Default = false,
+    Callback = function(value)
+        getgenv().ParryConfig.PingCompensation = value
+    end
+})
+
+GlobalBox:AddSlider('GlobalDelay', {
+    Text = 'Global Delay Offset (ms)',
+    Default = 0,
+    Min = -100,
+    Max = 100,
+    Rounding = 0,
+    Callback = function(value)
+        getgenv().ParryConfig.GlobalDelayOffset = value
+    end
+})
+
+GlobalBox:AddSlider('MaxDist', {
+    Text = 'Max Detection Distance',
+    Default = 20,
+    Min = 5,
+    Max = 50,
+    Rounding = 0,
+    Callback = function(value)
+        getgenv().ParryConfig.MaxDistance = value
+    end
+})
+
+-- --- TAB 2: BUILDER ---
+local BuilderLeft = Tabs.Builder:AddLeftGroupbox('Logged Animations')
+
+local selectedAnimId = ""
+local timingInput = 0.15
+local hitboxInput = 1
+local selectedAction = "Parry"
+local profileTimingName = ""
+
+BuilderLeft:AddToggle('LoggingActiveToggle', {
+    Text = 'Enable Animation Logging',
+    Default = true,
+    Callback = function(val)
+        loggingEnabled = val
+    end
+})
+
+local AnimDropdown = BuilderLeft:AddDropdown('LoggedAnimationsList', {
+    Values = {'Waiting for animations...'},
+    Default = 1,
+    Text = 'Detected Enemy Animations',
+})
+
+AnimDropdown:OnChanged(function(selectedValue)
+    if not selectedValue then return end
+
+    local id = animValueMap[selectedValue] or GetCleanAnimId(selectedValue)
+    if id and id ~= "" then
+        selectedAnimId = id
+        if Options.AnimIDInput then Options.AnimIDInput:SetValue(id) end
+
+        local profile = getgenv().ParryConfig.Profiles[id]
+        if profile then
+            if profile.Delay ~= nil and Options.ParryDelaySec then
+                Options.ParryDelaySec:SetValue(profile.Delay)
+                timingInput = profile.Delay
+            end
+            if profile.HitboxSize ~= nil and Options.HitboxMultiplier then
+                Options.HitboxMultiplier:SetValue(profile.HitboxSize)
+                hitboxInput = profile.HitboxSize
+            end
+            if profile.Name and Options.TimingNameInput then
+                Options.TimingNameInput:SetValue(profile.Name)
+                profileTimingName = profile.Name
+            end
+            if profile.Action and Options.ActionType then
+                Options.ActionType:SetValue(profile.Action)
+                selectedAction = profile.Action
+            end
+        end
+    end
+end)
+
+BuilderLeft:AddButton('Refresh Animation List', function()
+    animValueMap = {}
+    local values = {}
+    for id, data in pairs(LoggedAnimations) do
+        local profile = getgenv().ParryConfig.Profiles[id]
+        local displayName = (profile and profile.Name and profile.Name ~= "") and profile.Name or data.Name
+        local display = "[" .. id .. "] " .. displayName
+        animValueMap[display] = id
+        table.insert(values, display)
+    end
+    if #values == 0 then table.insert(values, 'No animations logged yet') end
+    AnimDropdown:SetValues(values)
+    Library:Notify("Refreshed animation list.", 2)
+end)
+
+BuilderLeft:AddButton('Clear Logged Animations', function()
+    LoggedAnimations = {}
+    animValueMap = {}
+    AnimDropdown:SetValues({'No animations logged yet'})
+    selectedAnimId = ""
+    if Options.AnimIDInput then Options.AnimIDInput:SetValue("") end
+    Library:Notify("Cleared all logged animations.", 3)
+end)
+
+local BuilderRight = Tabs.Builder:AddRightGroupbox('Timing & Hitbox Editor')
+
+BuilderRight:AddInput('AnimIDInput', {
+    Default = '',
+    Numeric = false,
+    Finished = false,
+    Text = 'Selected Animation ID',
+    Placeholder = 'Select above or paste ID...',
+    Callback = function(value)
+        selectedAnimId = GetCleanAnimId(value)
+    end
+})
+
+BuilderRight:AddInput('TimingNameInput', {
+    Default = '',
+    Numeric = false,
+    Finished = false,
+    Text = 'Timing Name',
+    Placeholder = 'Name your timing...',
+    Callback = function(value)
+        profileTimingName = value
+    end
+})
+
+BuilderRight:AddDropdown('ActionType', {
+    Values = {'Parry', 'Roll'},
+    Default = 'Parry',
+    Text = 'Reaction Action',
+    Callback = function(val)
+        selectedAction = val
+    end
+})
+
+BuilderRight:AddSlider('ParryDelaySec', {
+    Text = 'Trigger Delay (Seconds)',
+    Default = 0.15,
+    Min = 0.0,
+    Max = 1.0,
+    Rounding = 3,
+    Callback = function(val)
+        timingInput = val
+    end
+})
+
+BuilderRight:AddSlider('HitboxMultiplier', {
+    Text = 'Hitbox Multiplier / Radius',
+    Default = 1,
+    Min = 0.1,
+    Max = 20,
+    Rounding = 2,
+    Callback = function(val)
+        hitboxInput = val
+    end
+})
+
+BuilderRight:AddButton('Play Anim on Local Character', function()
+    PlayAnimationOnLocalCharacter(selectedAnimId)
+end)
+
+BuilderRight:AddButton('Stop Character Animation', function()
+    StopLocalCharacterAnimation()
+    Library:Notify("Stopped character animation preview.", 2)
+end)
+
+BuilderRight:AddButton('Save Timing to File', function()
+    if selectedAnimId == "" then
+        Library:Notify("Error: No Animation ID specified!", 3)
+        return
+    end
+    if profileTimingName == "" then
+        Library:Notify("Error: No Timing Name specified!", 3)
+        return
+    end
+
+    local ok, err = SaveTimingFile(profileTimingName, selectedAnimId, selectedAction, timingInput, hitboxInput)
+    if ok then
+        getgenv().ParryConfig.Profiles[selectedAnimId] = {
+            Name = profileTimingName,
+            Action = selectedAction,
+            Delay = timingInput,
+            HitboxSize = hitboxInput,
+            Enabled = true
+        }
+        Library:Notify("Saved timing '" .. profileTimingName .. "' & loaded it.", 3)
+    else
+        Library:Notify("Failed to save timing: " .. tostring(err), 3)
+    end
+end)
+
+-- --- TAB 3: TIMINGS ---
+local TimingsLeft = Tabs.Timings:AddLeftGroupbox('Saved Timing Files (Auto-Loaded)')
+
+local TimingsDropdown = TimingsLeft:AddDropdown('SavedTimingsList', {
+    Values = ListTimingFiles(),
+    Default = 1,
+    Text = 'Timing Files On Disk',
+})
+
+TimingsLeft:AddButton('Reload All Timings From Disk', function()
+    getgenv().ParryConfig.Profiles = {}
+    local n = LoadAllTimings()
+    TimingsDropdown:SetValues(ListTimingFiles())
+    Library:Notify("Reloaded " .. n .. " timing(s) from disk.", 3)
+end)
+
+TimingsLeft:AddButton('Delete Selected Timing File', function()
+    local value = TimingsDropdown.Value
+    if not value or value == "None" then
+        Library:Notify("No timing selected.", 3)
+        return
+    end
+    if DeleteTimingFile(value) then
+        TimingsDropdown:SetValues(ListTimingFiles())
+        Library:Notify("Deleted timing file: " .. value, 3)
+    else
+        Library:Notify("Failed to delete timing file!", 3)
+    end
+end)
+
+local TimingsRight = Tabs.Timings:AddRightGroupbox('Active Timings (Runtime)')
+
+local LoadedDropdown = TimingsRight:AddDropdown('LoadedTimingsList', {
+    Values = ListLoadedTimings(),
+    Default = 1,
+    Text = 'Currently Loaded Timings',
+})
+
+TimingsRight:AddButton('Refresh Loaded Timings', function()
+    loadedTimingMap = {}
+    local raw = ListLoadedTimings()
+    for _, label in ipairs(raw) do
+        local id = label:match("%[(%d+)%]")
+        if id then loadedTimingMap[label] = id end
+    end
+    LoadedDropdown:SetValues(raw)
+    Library:Notify("Refreshed loaded timings.", 2)
+end)
+
+TimingsRight:AddButton('Unload Selected Timing', function()
+    local value = LoadedDropdown.Value
+    if not value or value == "None" then
+        Library:Notify("No loaded timing selected.", 3)
+        return
+    end
+    local id = loadedTimingMap[value] or value:match("%[(%d+)%]")
+    if id and getgenv().ParryConfig.Profiles[id] then
+        getgenv().ParryConfig.Profiles[id] = nil
+        Library:Notify("Unloaded timing: " .. value, 3)
+    else
+        Library:Notify("Could not resolve timing to unload.", 3)
+    end
+end)
+
+TimingsRight:AddButton('Unload All Timings', function()
+    getgenv().ParryConfig.Profiles = {}
+    Library:Notify("Unloaded all timings (files remain on disk).", 3)
+end)
+
+-- --- TAB 4: SETTINGS ---
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+SaveManager:SetFolder("Evtariware/Configs")
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:ApplyToTab(Tabs.Settings)
+
+local MenuGroup = Tabs.Settings:AddLeftGroupbox('Menu')
+MenuGroup:AddButton('Unload Script', function()
+    Library:Unload()
+end)
+
+local MenuKeybind = MenuGroup:AddKeyPicker('MenuKeybind', {
+    Default = 'RightShift',
+    SyncToggleState = false,
+    Mode = 'Toggle',
+    Text = 'Close / Toggle UI',
+    NoUI = false,
+})
+
+Library.ToggleKeybind = MenuKeybind
+
+Library:OnUnload(function()
+    StopLocalCharacterAnimation()
+end)
+
+Library:Notify("Evtariware Loaded! Auto-loaded " .. loadedCount .. " timing(s).", 5)
