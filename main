@@ -49,6 +49,13 @@ getgenv().ParryConfig = {
     CounterInsteadOfParry = false,
     CounterAsFallback = false,
     CounterDelayOffset = 0,
+    HumanizationEnabled = false,
+    HumanizeRollChance = 0,
+    HumanizeMissedReactionChance = 0,
+    HumanizeReactToFeintChance = 0,
+    HumanizeReactionJitter = 0,
+    HumanizeCounterChance = 100,
+    HumanizeMissedCounterChance = 0,
     TrueDodgeEnabled = false,
     TrueDodgeAnimation = false
 }
@@ -212,6 +219,207 @@ local function ExecuteCounter()
         end
     end
     return nil
+end
+
+-- ==========================================
+-- PRECISE COOLDOWNS (PlayerInfo -> WeaponCooldown)
+-- ==========================================
+local function GetWeaponCooldownContainer()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local info = pg and pg:FindFirstChild("PlayerInfo")
+    local main = info and info:FindFirstChild("MainBG")
+    return main and main:FindFirstChild("WeaponCooldown")
+end
+
+local function ParseCooldownSeconds(frame)
+    if not frame then return nil end
+
+    local timeObj = frame:FindFirstChild("Time")
+    if not timeObj then
+        timeObj = frame:FindFirstChild("Time", true)
+    end
+    if not timeObj then return nil end
+
+    local text = timeObj.Text
+    if text == nil then return nil end
+    text = tostring(text)
+
+    local num = tonumber(text)
+    if num then return num end
+
+    local digits = text:match("(%d+%.?%d*)")
+    return digits and tonumber(digits) or nil
+end
+
+-- Returns remaining seconds. 0 = ready. nil = UI could not be read.
+local function GetGuiCooldownRemaining(frameName)
+    local wc = GetWeaponCooldownContainer()
+    if not wc then return nil end
+
+    local frame = wc:FindFirstChild(frameName)
+    if not frame then return 0 end
+
+    local seconds = ParseCooldownSeconds(frame)
+    if seconds ~= nil then
+        if seconds < 0 then seconds = 0 end
+        return seconds
+    end
+
+    if frame:IsA("GuiObject") and not frame.Visible then
+        return 0
+    end
+
+    return nil
+end
+
+local function GetParryCooldownRemaining()
+    return GetGuiCooldownRemaining("Parry")
+end
+
+local function GetDashCooldownRemaining()
+    return GetGuiCooldownRemaining("Dash")
+end
+
+-- Use the real UI cooldowns when available, otherwise keep the old estimates.
+local function GetCooldownState()
+    local now = os.clock()
+    local parryLeft = GetParryCooldownRemaining()
+    local dashLeft = GetDashCooldownRemaining()
+
+    if parryLeft == nil then
+        parryLeft = math.max(0, PARRY_COOLDOWN_TIME - (now - lastParryPress))
+    end
+    if dashLeft == nil then
+        dashLeft = math.max(0, ROLL_KEY_COOLDOWN - (now - lastRollKey))
+    end
+
+    return parryLeft, dashLeft
+end
+
+local function SelectFallbackAction(enemyChar, allowCounter)
+    if allowCounter == nil then allowCounter = true end
+
+    local cfg = getgenv().ParryConfig
+    local parryLeft, dashLeft = GetCooldownState()
+    local counterReady = false
+    if allowCounter then
+        counterReady = GetReadyCounterSlot() ~= nil
+    end
+
+    -- Positional override: if they're behind you, roll when dash is available,
+    -- even if parry itself is ready.
+    if cfg.RollIfBehind and IsOpponentBehind(enemyChar) and dashLeft <= 0 then
+        return "Roll"
+    end
+
+    if allowCounter and cfg.CounterInsteadOfParry and counterReady then
+        return "Counter"
+    end
+
+    if parryLeft <= 0 then
+        return "Parry"
+    end
+
+    if cfg.RollOnParryCooldown and dashLeft <= 0 then
+        return "Roll"
+    end
+
+    if allowCounter and cfg.CounterAsFallback and counterReady then
+        return "Counter"
+    end
+
+    return "Parry"
+end
+
+local function ClampPercent(v)
+    v = tonumber(v) or 0
+    if v < 0 then return 0 end
+    if v > 100 then return 100 end
+    return v
+end
+
+-- Normalizes a pair of exclusive chances. If they total more than 100%,
+-- they are scaled down proportionally. Any leftover under 100% belongs to
+-- the normal action.
+local function NormalizePair(a, b)
+    a = ClampPercent(a)
+    b = ClampPercent(b)
+    local total = a + b
+    if total > 100 then
+        local scale = 100 / total
+        a = a * scale
+        b = b * scale
+    end
+    return a, b
+end
+
+-- Counter chance is deliberately independent of the Humanization toggle.
+-- It only needs a counter feature (Auto Counter or Counter Fallback) enabled.
+local function ApplyCounterChance(action, enemyChar)
+    if action ~= "Counter" then return action end
+
+    local cfg = getgenv().ParryConfig
+    if not (cfg.CounterInsteadOfParry or cfg.CounterAsFallback) then
+        return action
+    end
+
+    local counterChance, missedCounterChance = NormalizePair(
+        cfg.HumanizeCounterChance,
+        cfg.HumanizeMissedCounterChance
+    )
+
+    local roll = math.random() * 100
+    if roll < counterChance then
+        return "Counter"
+    elseif roll < counterChance + missedCounterChance then
+        return nil
+    end
+
+    -- Counter was skipped: fall back to the normal defensive action.
+    return SelectFallbackAction(enemyChar, false)
+end
+
+local function ApplyHumanization(action, enemyChar)
+    local cfg = getgenv().ParryConfig
+    if not cfg.HumanizationEnabled or not action then
+        return action
+    end
+
+    if action == "Counter" then
+        return action
+    end
+
+    if action == "Parry" then
+        local rollChance, missChance = NormalizePair(
+            cfg.HumanizeRollChance,
+            cfg.HumanizeMissedReactionChance
+        )
+        local roll = math.random() * 100
+
+        if roll < rollChance then
+            local _, dashLeft = GetCooldownState()
+            if dashLeft <= 0 then
+                return "Roll"
+            end
+            return "Parry"
+        elseif roll < rollChance + missChance then
+            return nil
+        end
+        return "Parry"
+    end
+
+    if action == "Roll" then
+        local _, missChance = NormalizePair(
+            cfg.HumanizeRollChance,
+            cfg.HumanizeMissedReactionChance
+        )
+        if math.random() * 100 < missChance then
+            return nil
+        end
+        return "Roll"
+    end
+
+    return action
 end
 
 -- ==========================================
@@ -488,32 +696,72 @@ local function SendRollKey()
     if now - lastRollKey < ROLL_KEY_COOLDOWN then return false end
     lastRollKey = now
     VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
-    task.wait(0.05)
-    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+    -- Release the key without blocking, so the roll-cancel timer starts at the
+    -- actual moment the roll was pressed.
+    task.delay(0.05, function()
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
+        end)
+    end)
     return true
 end
 
 local function ExecuteParry() if SendParryKey() then lastParryPress = os.clock(); return true end return false end
 local function ExecuteRoll() return SendRollKey() end
 
-local function ExecuteM2Cancel()
-    if type(mouse2click) == "function" then if pcall(mouse2click) then return end end
+-- Roll cancel in this game is a right-click CLICK (press + release). The
+-- DashCancel remote does nothing, and a press without the release does nothing.
+local function ExecuteRollCancel()
+    if type(mouse2click) == "function" then
+        if pcall(mouse2click) then return true end
+    end
+
+    if type(mouse2press) == "function" then
+        if pcall(mouse2press) then
+            task.delay(0.05, function()
+                if type(mouse2release) == "function" then pcall(mouse2release) end
+            end)
+            return true
+        end
+    end
+
     local loc = UserInputService:GetMouseLocation()
-    local ok1 = pcall(function()
+    local ok = pcall(function()
         VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, true, game, 1)
-        task.wait(0.03)
-        VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, false, game, 1)
     end)
-    if ok1 then return end
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 2, true, game, 0)
-        task.wait(0.03)
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 2, false, game, 0)
-    end)
+    if ok then
+        task.delay(0.05, function()
+            pcall(function()
+                VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, false, game, 1)
+            end)
+        end)
+    end
+    return ok
 end
 
 local function ExecuteAction(action)
-    if action == "Roll" then ExecuteRoll(); return "Roll" end
+    if action == "Roll" then
+        if not ExecuteRoll() then
+            -- The roll key was throttled, so nothing is rolling. Parry instead
+            -- of firing a cancel into nothing.
+            ExecuteParry()
+            return "Parry"
+        end
+
+        -- Roll cancel belongs to the roll itself, so it is scheduled here, at
+        -- the moment the roll key is sent, regardless of what caused the roll.
+        if getgenv().ParryConfig.AutoRollCancel then
+            local cancelDelay = tonumber(getgenv().ParryConfig.RollCancelDelay) or 0
+            if cancelDelay < 0 then cancelDelay = 0 end
+            task.delay(cancelDelay, function()
+                -- A zero delay should still cancel, but the dash has to be
+                -- registered first, so give it one frame.
+                if cancelDelay <= 0 then task.wait() end
+                pcall(ExecuteRollCancel)
+            end)
+        end
+        return "Roll"
+    end
     if action == "Counter" then
         local res = ExecuteCounter()
         if res then return res end
@@ -610,15 +858,9 @@ local function OnAnimationPlayed(humanoid, track)
         if #pointsToRun == 0 then return end
 
         local hb = profile.Hitbox or MakeDefaultHitbox(profile.HitboxSize or 25)
-        if not IsEnemyInHitbox(char, hb) then return end
-
-        if getgenv().ParryConfig.LimitMaxDistance and LocalPlayer.Character then
-            local myHrp = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-            local enemyHrp = char:FindFirstChild("HumanoidRootPart")
-            if myHrp and enemyHrp and (myHrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.MaxDistance then
-                return
-            end
-        end
+        -- Don't range-check here. An attack can start outside the hitbox and
+        -- move into range during its windup. Range is validated at the actual
+        -- reaction point inside each spawned point task below.
 
         for _, pt in ipairs(pointsToRun) do
             task.spawn(function()
@@ -635,16 +877,22 @@ local function OnAnimationPlayed(humanoid, track)
 
                 local willBeCounter = false
                 if (pt.Action or "Parry") == "Parry" then
-                    local now = os.clock()
-                    local parryCDLeft = PARRY_COOLDOWN_TIME - (now - lastParryPress)
-                    local rollCDLeft  = ROLL_KEY_COOLDOWN - (now - lastRollKey)
+                    local cfg = getgenv().ParryConfig
+                    local parryCDLeft, rollCDLeft = GetCooldownState()
                     local counterReady = GetReadyCounterSlot() ~= nil
+                    local parryReadyAtTrigger = parryCDLeft <= baseDelay
+                    local dashReadyAtTrigger = rollCDLeft <= baseDelay
+                    local rollBehind = cfg.RollIfBehind and IsOpponentBehind(char) and dashReadyAtTrigger
 
-                    if getgenv().ParryConfig.CounterInsteadOfParry and counterReady then
-                        willBeCounter = true
-                    elseif getgenv().ParryConfig.CounterAsFallback and counterReady and parryCDLeft > baseDelay then
-                        local wouldRoll = getgenv().ParryConfig.RollOnParryCooldown and (rollCDLeft <= baseDelay)
-                        if not wouldRoll then willBeCounter = true end
+                    if not rollBehind then
+                        if cfg.CounterInsteadOfParry and counterReady then
+                            willBeCounter = true
+                        elseif cfg.CounterAsFallback and counterReady then
+                            local rollOnCD = cfg.RollOnParryCooldown and dashReadyAtTrigger
+                            if not parryReadyAtTrigger and not rollOnCD then
+                                willBeCounter = true
+                            end
+                        end
                     end
                 end
 
@@ -652,6 +900,14 @@ local function OnAnimationPlayed(humanoid, track)
                 if willBeCounter then
                     delay = delay + (getgenv().ParryConfig.CounterDelayOffset or 0)
                     if delay < 0 then delay = 0 end
+                end
+
+                if getgenv().ParryConfig.HumanizationEnabled then
+                    local jitter = math.floor(tonumber(getgenv().ParryConfig.HumanizeReactionJitter) or 0)
+                    if jitter > 0 then
+                        delay = delay + (math.random(-jitter, jitter) / 1000)
+                        if delay < 0 then delay = 0 end
+                    end
                 end
 
                 local startClock = os.clock()
@@ -668,7 +924,17 @@ local function OnAnimationPlayed(humanoid, track)
                         if not track.IsPlaying then
                             if getgenv().ParryConfig.ReactToFeints and IsFeintPlaying(char) then
                                 FeintedTracks[track] = true
-                                triggeredEarly = true
+
+                                local reactChance = 100
+                                if getgenv().ParryConfig.HumanizationEnabled then
+                                    reactChance = ClampPercent(getgenv().ParryConfig.HumanizeReactToFeintChance)
+                                end
+
+                                if math.random() * 100 < reactChance then
+                                    triggeredEarly = true
+                                else
+                                    shouldFire = false
+                                end
                                 break
                             else
                                 shouldFire = false
@@ -687,39 +953,36 @@ local function OnAnimationPlayed(humanoid, track)
                 if not shouldFire then return end
                 if not triggeredEarly and not track.IsPlaying then return end
 
+                -- Validate range at the moment the parry actually fires.
+                -- This allows "started outside, entered the hitbox during the
+                -- animation" reactions.
                 if not IsEnemyInHitbox(char, hb) then
                     return
+                end
+
+                -- Apply the optional max-distance limit at reaction time too,
+                -- instead of only at animation start.
+                if getgenv().ParryConfig.LimitMaxDistance then
+                    local myChar = LocalPlayer.Character
+                    local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                    local enemyHrp = char:FindFirstChild("HumanoidRootPart")
+                    if not myHrp or not enemyHrp then return end
+                    if (myHrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.MaxDistance then
+                        return
+                    end
                 end
 
                 local action = pt.Action or "Parry"
 
                 if action == "Parry" then
-                    local parryOnCD = (os.clock() - lastParryPress) < PARRY_COOLDOWN_TIME
-                    local rollOnCD = (os.clock() - lastRollKey) < ROLL_KEY_COOLDOWN
-                    local counterReady = GetReadyCounterSlot() ~= nil
-
-                    if getgenv().ParryConfig.CounterInsteadOfParry and counterReady then
-                        action = "Counter"
-                    else
-                        if not parryOnCD then
-                            action = "Parry"
-                        elseif getgenv().ParryConfig.RollOnParryCooldown and not rollOnCD then
-                            if getgenv().ParryConfig.RollIfBehind and IsOpponentBehind(char) then
-                                action = "Roll"
-                            elseif not getgenv().ParryConfig.RollIfBehind then
-                                action = "Roll"
-                            end
-                        elseif getgenv().ParryConfig.CounterAsFallback and counterReady then
-                            action = "Counter"
-                        else
-                            action = "Parry"
-                        end
-                    end
+                    action = SelectFallbackAction(char)
                 end
 
-                local performed = ExecuteAction(action)
-                if performed == "Roll" and getgenv().ParryConfig.AutoRollCancel then
-                    task.spawn(function() task.wait(getgenv().ParryConfig.RollCancelDelay); ExecuteM2Cancel() end)
+                action = ApplyCounterChance(action, char)
+                action = ApplyHumanization(action, char)
+
+                if action then
+                    ExecuteAction(action)
                 end
             end)
         end
@@ -902,6 +1165,81 @@ local uiSuccess, uiErr = pcall(function()
 
     DodgeGroup:AddToggle('TDA', {Text = 'True Dodge Animation', Default = false, Callback = function(v) getgenv().ParryConfig.TrueDodgeAnimation = v end})
 
+    -- ==========================================
+    -- HUMANIZATION SUBTAB
+    -- ==========================================
+    local HumanGroup
+    local hasLeftTabbox = type(Tabs.Combat.AddLeftTabbox) == "function"
+    if hasLeftTabbox then
+        local ok, box = pcall(function() return Tabs.Combat:AddLeftTabbox() end)
+        if ok and box then
+            local ok2, tab = pcall(function() return box:AddTab('Humanization') end)
+            if ok2 and tab then
+                HumanGroup = tab
+            end
+        end
+    end
+    if not HumanGroup then
+        HumanGroup = Tabs.Combat:AddLeftGroupbox('Humanization')
+    end
+
+    HumanGroup:AddToggle('HUMAN', {
+        Text = 'Humanization',
+        Default = false,
+        Callback = function(v) getgenv().ParryConfig.HumanizationEnabled = v end
+    })
+    -- Live readout of the normalized percentages.
+    local FillLabel, CntLabel
+    local okLbl1, l1 = pcall(function() return HumanGroup:AddLabel('Roll 0% / Miss 0% / Parry 100%') end)
+    if okLbl1 then FillLabel = l1 end
+    local okLbl2, l2 = pcall(function() return HumanGroup:AddLabel('Counter 100% / Miss 0%') end)
+    if okLbl2 then CntLabel = l2 end
+
+    local function UpdateHumanReadout()
+        local cfg = getgenv().ParryConfig
+        local pr, pm = NormalizePair(cfg.HumanizeRollChance, cfg.HumanizeMissedReactionChance)
+        local ch, cm = NormalizePair(cfg.HumanizeCounterChance, cfg.HumanizeMissedCounterChance)
+        local parryLeft = 100 - pr - pm
+        if parryLeft < 0 then parryLeft = 0 end
+        if FillLabel then
+            pcall(function()
+                FillLabel:SetText(string.format('Roll %.0f%% / Miss %.0f%% / Parry %.0f%%', pr, pm, parryLeft))
+            end)
+        end
+        if CntLabel then
+            pcall(function()
+                CntLabel:SetText(string.format('Counter %.0f%% / Miss %.0f%%', ch, cm))
+            end)
+        end
+    end
+
+    HumanGroup:AddSlider('HROLL', {
+        Text = 'Roll Instead of Parry %',
+        Default = 0, Min = 0, Max = 100, Rounding = 0,
+        Callback = function(v)
+            getgenv().ParryConfig.HumanizeRollChance = v
+            UpdateHumanReadout()
+        end
+    })
+    HumanGroup:AddSlider('HMISS', {
+        Text = 'Missed Reaction %',
+        Default = 0, Min = 0, Max = 100, Rounding = 0,
+        Callback = function(v)
+            getgenv().ParryConfig.HumanizeMissedReactionChance = v
+            UpdateHumanReadout()
+        end
+    })
+    HumanGroup:AddSlider('HFEINT', {
+        Text = 'React to Feint %',
+        Default = 0, Min = 0, Max = 100, Rounding = 0,
+        Callback = function(v) getgenv().ParryConfig.HumanizeReactToFeintChance = v end
+    })
+    HumanGroup:AddSlider('HJITTER', {
+        Text = 'Reaction Jitter ms',
+        Default = 0, Min = 0, Max = 200, Rounding = 0,
+        Callback = function(v) getgenv().ParryConfig.HumanizeReactionJitter = v end
+    })
+
     local Glob = Tabs.Combat:AddRightGroupbox('Global Parameters')
     
     Glob:AddSlider('GD', {Text = 'Global Delay Offset', Default = 0, Min = -100, Max = 100, Rounding = 0, Callback = function(v) 
@@ -951,6 +1289,24 @@ local uiSuccess, uiErr = pcall(function()
 
     local Cntr = Tabs.Combat:AddRightGroupbox('Counters')
     Cntr:AddToggle('CIP', {Text = 'Auto Counter', Default = false, Callback = function(v) getgenv().ParryConfig.CounterInsteadOfParry = v end})
+
+    Cntr:AddSlider('HCOUNTER', {
+        Text = 'Counter Chance (%)',
+        Default = 100, Min = 0, Max = 100, Rounding = 0,
+        Callback = function(v)
+            getgenv().ParryConfig.HumanizeCounterChance = v
+            UpdateHumanReadout()
+        end
+    })
+    Cntr:AddSlider('HMISSCOUNTER', {
+        Text = 'Missed Counter Chance (%)',
+        Default = 0, Min = 0, Max = 100, Rounding = 0,
+        Callback = function(v)
+            getgenv().ParryConfig.HumanizeMissedCounterChance = v
+            UpdateHumanReadout()
+        end
+    })
+
     Cntr:AddToggle('CAF', {Text = 'Counter Fallback', Default = false, Callback = function(v) getgenv().ParryConfig.CounterAsFallback = v end})
     
     Cntr:AddSlider('CDO', {Text = 'Counter Delay Offset', Default = 0, Min = -1, Max = 1, Rounding = 3, Callback = function(v) 
