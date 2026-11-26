@@ -50,7 +50,9 @@ getgenv().ParryConfig = {
     Profiles = {},
     CounterInsteadOfParry = false,
     CounterAsFallback = false,
-    CounterDelayOffset = 0,
+    CounterDelayOffset = -0.1,
+    AutoCounterHitboxMultiplier = 0.75,
+    LiveHitboxVisualizer = false,
     HumanizationEnabled = false,
     HumanizeRollChance = 0,
     HumanizeMissedReactionChance = 0,
@@ -266,39 +268,96 @@ end
 -- ==========================================
 -- BLOCK INPUT SYSTEM
 -- ==========================================
-local function TriggerBlockInput()
-    if not getgenv().ParryConfig.BlockInputEnabled then return end
-    
+local BLOCK_ACTION_NAME = "EvtariwareBlock"
+local blockInputExpiresAt = 0
+local blockInputBound = false
+local blockInputKeySig = ""
+local blockInputWatchdogRunning = false
+
+local function GetBlockInputKeys()
+    local cfg = getgenv().ParryConfig
     local keys = {}
-    if getgenv().ParryConfig.BlockInputM1 then 
-        table.insert(keys, Enum.UserInputType.MouseButton1) 
+    if cfg.BlockInputM1 then
+        table.insert(keys, Enum.UserInputType.MouseButton1)
     end
-    if getgenv().ParryConfig.BlockInputSkills then 
+    if cfg.BlockInputSkills then
         table.insert(keys, Enum.KeyCode.Two)
         table.insert(keys, Enum.KeyCode.Three)
         table.insert(keys, Enum.KeyCode.Four)
         table.insert(keys, Enum.KeyCode.Five)
     end
-    if getgenv().ParryConfig.BlockInputWeaponSkills then
+    if cfg.BlockInputWeaponSkills then
         table.insert(keys, Enum.KeyCode.E)
         table.insert(keys, Enum.KeyCode.R)
     end
-    
+    return keys
+end
+
+local function UnbindBlockInput()
+    blockInputBound = false
+    blockInputKeySig = ""
+    pcall(function()
+        ContextActionService:UnbindAction(BLOCK_ACTION_NAME)
+    end)
+end
+
+local function WatchBlockInputWindow()
+    if blockInputWatchdogRunning then return end
+    blockInputWatchdogRunning = true
+    task.spawn(function()
+        while blockInputBound do
+            if not getgenv().ParryConfig.BlockInputEnabled then
+                UnbindBlockInput()
+                break
+            end
+            if os.clock() >= blockInputExpiresAt then
+                UnbindBlockInput()
+                break
+            end
+            task.wait(0.03)
+        end
+        blockInputWatchdogRunning = false
+    end)
+end
+
+local function TriggerBlockInput()
+    local cfg = getgenv().ParryConfig
+    if not cfg or not cfg.BlockInputEnabled then return end
+
+    local punishTime = tonumber(cfg.BlockInputPunishableTime) or 0.5
+    if punishTime <= 0 then return end
+
+    local keys = GetBlockInputKeys()
     if #keys == 0 then return end
 
-    local function sink() 
-        return Enum.ContextActionResult.Sink 
+    -- Renew the window on every new reaction instead of letting an older
+    -- timer unbind it early.
+    blockInputExpiresAt = os.clock() + punishTime
+
+    local sigParts = {}
+    for _, k in ipairs(keys) do table.insert(sigParts, tostring(k)) end
+    local sig = table.concat(sigParts, "|")
+
+    if blockInputBound and sig ~= blockInputKeySig then
+        UnbindBlockInput()
     end
-    
-    -- Bind at priority 3000 to intercept and block the inputs
-    ContextActionService:BindActionAtPriority("EvtariwareBlock", sink, false, 3000, unpack(keys))
-    
-    local punishTime = getgenv().ParryConfig.BlockInputPunishableTime or 0.5
-    task.delay(punishTime, function()
-        pcall(function()
-            ContextActionService:UnbindAction("EvtariwareBlock")
+
+    if not blockInputBound then
+        local ok = pcall(function()
+            ContextActionService:BindActionAtPriority(
+                BLOCK_ACTION_NAME,
+                function() return Enum.ContextActionResult.Sink end,
+                false,
+                3000,
+                table.unpack(keys)
+            )
         end)
-    end)
+        if not ok then return end
+        blockInputBound = true
+        blockInputKeySig = sig
+    end
+
+    WatchBlockInputWindow()
 end
 
 -- ==========================================
@@ -573,6 +632,20 @@ local function IsEnemyInHitbox(enemyChar, hitbox)
     end
 end
 
+-- Counters are riskier than parry/roll, so they use their own (usually tighter)
+-- range on top of the timing hitbox and the global hitbox multiplier.
+local function IsCounterInRange(enemyChar, hitbox)
+    local cfg = getgenv().ParryConfig
+    local mult = tonumber(cfg.AutoCounterHitboxMultiplier) or 1
+    if mult < 0.05 then mult = 0.05 end
+    local globalMult = tonumber(cfg.GlobalHitboxMultiplier) or 1
+    if globalMult <= 0 then globalMult = 1 end
+
+    local hb = NormalizeHitbox(hitbox)
+    local size = math.max(0.1, (hb.Size or 25) * globalMult * mult)
+    return IsEnemyInHitbox(enemyChar, {Size = size, Shape = hb.Shape})
+end
+
 local currentHitbox = MakeDefaultHitbox(25)
 local HitboxVisualizerPart, HitboxVisualizerConn = nil, nil
 
@@ -610,6 +683,66 @@ local function StartHitboxVisualizer()
         HitboxVisualizerPart.Transparency = hb.Transparency
         HitboxVisualizerPart.Color = Color3.new(hb.ColorR, hb.ColorG, hb.ColorB)
         HitboxVisualizerPart.CFrame = hrp.CFrame
+    end)
+end
+
+-- ==========================================
+-- LIVE HITBOX VISUALIZER (on the attacker)
+-- ==========================================
+local LiveHitboxEntries = {}
+
+local function StopLiveHitbox(track)
+    local entry = LiveHitboxEntries[track]
+    if not entry then return end
+    LiveHitboxEntries[track] = nil
+    if entry.Conn then pcall(function() entry.Conn:Disconnect() end) end
+    if entry.Part then pcall(function() entry.Part:Destroy() end) end
+end
+
+local function StopAllLiveHitboxes()
+    for track in pairs(LiveHitboxEntries) do
+        StopLiveHitbox(track)
+    end
+end
+
+local function StartLiveHitbox(track, enemyChar, hitbox)
+    StopLiveHitbox(track)
+    if not enemyChar or not enemyChar.Parent then return end
+
+    local hb = NormalizeHitbox(hitbox)
+    local mult = tonumber(getgenv().ParryConfig.GlobalHitboxMultiplier) or 1
+    if mult <= 0 then mult = 1 end
+
+    local size = math.max(0.1, (hb.Size or 25) * mult)
+    local part = Instance.new("Part")
+    part.Name = "Evtariware_LiveHitbox"
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.CastShadow = false
+    part.Material = Enum.Material.ForceField
+    part.Shape = (hb.Shape == "Sphere") and Enum.PartType.Ball or Enum.PartType.Block
+    part.Size = Vector3.new(size, size, size)
+    part.Color = Color3.new(hb.ColorR or 1, hb.ColorG or 0.2, hb.ColorB or 0.2)
+    part.Transparency = hb.Transparency or 0.5
+    part.Parent = workspace
+
+    local startedAt = os.clock()
+    local entry = {Part = part}
+    LiveHitboxEntries[track] = entry
+
+    entry.Conn = RunService.RenderStepped:Connect(function()
+        if not part.Parent or os.clock() - startedAt > 12 then
+            StopLiveHitbox(track)
+            return
+        end
+        local hrp = enemyChar and enemyChar:FindFirstChild("HumanoidRootPart")
+        if not hrp then
+            StopLiveHitbox(track)
+            return
+        end
+        part.CFrame = hrp.CFrame
     end)
 end
 
@@ -884,6 +1017,7 @@ local function OnAnimationPlayed(humanoid, track)
         track.Stopped:Connect(function()
             ActiveTracks[track] = nil
             FeintedTracks[track] = nil
+            StopLiveHitbox(track)
         end)
 
         if getgenv().ParryConfig.OnlyTargetPlayer then
@@ -911,6 +1045,10 @@ local function OnAnimationPlayed(humanoid, track)
 
         local hb = profile.Hitbox or MakeDefaultHitbox(profile.HitboxSize or 25)
 
+        if getgenv().ParryConfig.LiveHitboxVisualizer then
+            StartLiveHitbox(track, char, hb)
+        end
+
         for _, pt in ipairs(pointsToRun) do
             task.spawn(function()
                 if FeintedTracks[track] then return end
@@ -935,6 +1073,7 @@ local function OnAnimationPlayed(humanoid, track)
 
                 local willBeCounter = false
                 local willBeRoll = false
+                local counterInRange = true
                 if (pt.Action or "Parry") == "Parry" then
                     local cfg = getgenv().ParryConfig
                     local parryCDLeft, rollCDLeft = GetCooldownState()
@@ -943,10 +1082,12 @@ local function OnAnimationPlayed(humanoid, track)
                     local dashReadyAtTrigger = rollCDLeft <= compensatedDelay
                     local rollBehind = cfg.RollIfBehind and IsOpponentBehind(char) and dashReadyAtTrigger
 
+                    counterInRange = IsCounterInRange(char, hb)
+
                     if rollBehind then willBeRoll = true
                     else
-                        if cfg.CounterInsteadOfParry and counterReady then willBeCounter = true
-                        elseif cfg.CounterAsFallback and counterReady then
+                        if cfg.CounterInsteadOfParry and counterReady and counterInRange then willBeCounter = true
+                        elseif cfg.CounterAsFallback and counterReady and counterInRange then
                             local rollOnCD = cfg.RollOnParryCooldown and dashReadyAtTrigger
                             if not parryReadyAtTrigger and not rollOnCD then willBeCounter = true end
                         end
@@ -1037,7 +1178,12 @@ local function OnAnimationPlayed(humanoid, track)
                 end
 
                 local action = pt.Action or "Parry"
-                if action == "Parry" then action = SelectFallbackAction(char) end
+                if action == "Parry" then
+                    -- Re-check at the real fire moment; if the counter range fails,
+                    -- this behaves exactly like auto counter being off.
+                    counterInRange = IsCounterInRange(char, hb)
+                    action = SelectFallbackAction(char, counterInRange)
+                end
                 action = ApplyCounterChance(action, char)
                 action = ApplyHumanization(action, char)
 
@@ -1344,6 +1490,10 @@ local uiSuccess, uiErr = pcall(function()
             if not isUpdatingUI and Options.GloHB then isUpdatingUI = true; Options.GloHB:SetValue(num); isUpdatingUI = false end
         end
     end})
+    Glob:AddToggle('LiveHB', {Text = 'Live Hitbox Visualizer', Default = false, Callback = function(v)
+        getgenv().ParryConfig.LiveHitboxVisualizer = v
+        if not v then StopAllLiveHitboxes() end
+    end})
 
     -- Ping Compensation
     pcall(function() Glob:AddLabel('Ping Compensation') end)
@@ -1397,17 +1547,24 @@ local uiSuccess, uiErr = pcall(function()
     end})
     Glob:AddToggle('FrameCorr', {Text = 'Frame Overhead Correction', Default = true, Callback = function(v) getgenv().ParryConfig.FrameOverheadCorrection = v end})
 
-    local PingReadout
-    local okPingReadout, pr = pcall(function() return Glob:AddLabel('Ping: -- ms | Comp: -- ms') end)
-    if okPingReadout then PingReadout = pr end
+    local PingReadoutA, PingReadoutB
+    local okA, la = pcall(function() return Glob:AddLabel('Ping: -- ms | Jitter: -- ms') end)
+    if okA then PingReadoutA = la end
+    local okB, lb = pcall(function() return Glob:AddLabel('Comp: -- ms | Frame: -- ms') end)
+    if okB then PingReadoutB = lb end
     task.spawn(function()
         while true do
             task.wait(0.5)
-            if PingReadout then
-                local cfg = getgenv().ParryConfig
-                local mode = (cfg and cfg.PingCompensationMode) or 'Balanced'
+            local compMs = GetPingCompensation() * 1000
+            local frameMs = GetFrameCorrection() * 1000
+            if PingReadoutA then
                 pcall(function()
-                    PingReadout:SetText(string.format('Ping: %.0f ms | Jitter: %.0f ms | Comp: %.0f ms (%s) | Frame: %.0f ms', CachedPingMs, PingJitter, GetPingCompensation() * 1000, tostring(mode), GetFrameCorrection() * 1000))
+                    PingReadoutA:SetText(string.format('Ping: %.0f ms | Jitter: %.0f ms', CachedPingMs, PingJitter))
+                end)
+            end
+            if PingReadoutB then
+                pcall(function()
+                    PingReadoutB:SetText(string.format('Comp: %.0f ms | Frame: %.0f ms', compMs, frameMs))
                 end)
             end
         end
@@ -1418,14 +1575,25 @@ local uiSuccess, uiErr = pcall(function()
 
     local Cntr = Tabs.Combat:AddRightGroupbox('Counters')
     Cntr:AddToggle('CIP', {Text = 'Auto Counter', Default = false, Callback = function(v) getgenv().ParryConfig.CounterInsteadOfParry = v end})
+    Cntr:AddSlider('ACTHB', {Text = 'Auto Counter Hitbox Multiplier', Default = 0.75, Min = 0.1, Max = 5, Rounding = 2, Callback = function(v)
+        getgenv().ParryConfig.AutoCounterHitboxMultiplier = v
+        if not isUpdatingUI and Options.ACTHBInput then isUpdatingUI = true; Options.ACTHBInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    Cntr:AddInput('ACTHBInput', {Default = '0.75', Text = 'Precise Auto Counter Hitbox Mult', Placeholder = 'e.g. 0.75', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.AutoCounterHitboxMultiplier = num
+            if not isUpdatingUI and Options.ACTHB then isUpdatingUI = true; Options.ACTHB:SetValue(num); isUpdatingUI = false end
+        end
+    end})
     Cntr:AddSlider('HCOUNTER', {Text = 'Counter Chance (%)', Default = 100, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeCounterChance = v; UpdateHumanReadout() end})
     Cntr:AddSlider('HMISSCOUNTER', {Text = 'Missed Counter Chance (%)', Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeMissedCounterChance = v; UpdateHumanReadout() end})
     Cntr:AddToggle('CAF', {Text = 'Counter Fallback', Default = false, Callback = function(v) getgenv().ParryConfig.CounterAsFallback = v end})
-    Cntr:AddSlider('CDO', {Text = 'Counter Delay Offset', Default = 0, Min = -1, Max = 1, Rounding = 3, Callback = function(v) 
+    Cntr:AddSlider('CDO', {Text = 'Counter Delay Offset', Default = -0.1, Min = -1, Max = 1, Rounding = 3, Callback = function(v) 
         getgenv().ParryConfig.CounterDelayOffset = v 
         if not isUpdatingUI and Options.CDOInput then isUpdatingUI = true; Options.CDOInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
-    Cntr:AddInput('CDOInput', {Default = '0', Text = 'Precise Counter Delay Offset', Placeholder = 'e.g. -0.1', Finished = true, Callback = function(v)
+    Cntr:AddInput('CDOInput', {Default = '-0.1', Text = 'Precise Counter Delay Offset', Placeholder = 'e.g. -0.1', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
             getgenv().ParryConfig.CounterDelayOffset = num
