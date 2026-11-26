@@ -14,6 +14,7 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local SoundService = game:GetService("SoundService")
+local ContextActionService = game:GetService("ContextActionService")
 local LocalPlayer = Players.LocalPlayer
 
 local MainFolder = "Evtariware"
@@ -39,7 +40,8 @@ getgenv().ParryConfig = {
     RollOnParryCooldown = false,
     RollIfBehind = false,
     AutoRollCancel = false,
-    RollCancelDelay = 0.2,
+    RollCancelDelay = 0.1,
+    RollDelayOffset = 0,
     ReactToFeints = false,
     LogOwnAnimations = false,
     LoggerDistanceCheck = false,
@@ -57,11 +59,29 @@ getgenv().ParryConfig = {
     HumanizeCounterChance = 100,
     HumanizeMissedCounterChance = 0,
     TrueDodgeEnabled = false,
-    TrueDodgeAnimation = false
+    TrueDodgeAnimation = false,
+    PingCompensationEnabled = false,
+    PingCompensationMultiplier = 1,
+    PingCompensationMax = 0.5,
+    PingCompensationBaseline = 0,
+    PingCompensationMode = "Balanced",
+    PingCompensationExtraLead = 0,
+    PingCompensationJitterGuard = 50,
+    LateReactionGrace = 100,
+    FrameOverheadCorrection = true,
+    GlobalHitboxMultiplier = 1,
+    
+    -- Block Input Settings
+    BlockInputEnabled = false,
+    BlockInputHitboxMultiplier = 1,
+    BlockInputPunishableTime = 0.5,
+    BlockInputM1 = true,
+    BlockInputSkills = true,
+    BlockInputWeaponSkills = true
 }
 
 local LoggedAnimations = {}
-local loggingEnabled = true
+local loggingEnabled = false
 local localPreviewTrack = nil
 local animValueMap = {}
 local loadedTimingMap = {}
@@ -111,6 +131,177 @@ local function IsFeintPlaying(char)
 end
 
 -- ==========================================
+-- PING MEASUREMENT & COMPENSATION
+-- ==========================================
+local CachedPingMs = 0
+local PingSamples = {}
+local PING_SAMPLE_COUNT = 20
+local PingAvg, PingMedian, PingP75, PingMax, PingJitter = 0, 0, 0, 0, 0
+local LegacyPingMs = 0
+
+local StatsService = game:GetService("Stats")
+
+local function ReadPingMs()
+    -- GetNetworkPing() returns seconds and is usually the most responsive source.
+    local ok, pingSec = pcall(function()
+        return LocalPlayer:GetNetworkPing()
+    end)
+    if ok and type(pingSec) == "number" and pingSec > 0 then
+        local ms = pingSec * 1000
+        if ms >= 1 and ms < 10000 then return ms end
+    end
+
+    local ok2, pingMs = pcall(function()
+        return StatsService.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok2 and type(pingMs) == "number" and pingMs >= 1 and pingMs < 10000 then
+        return pingMs
+    end
+    return nil
+end
+
+task.spawn(function()
+    while true do
+        local ping = ReadPingMs()
+        if ping then
+            table.insert(PingSamples, ping)
+            while #PingSamples > PING_SAMPLE_COUNT do
+                table.remove(PingSamples, 1)
+            end
+
+            local sorted = {}
+            local sum = 0
+            for i, v in ipairs(PingSamples) do
+                sorted[i] = v
+                sum = sum + v
+            end
+            table.sort(sorted)
+
+            PingAvg = sum / #PingSamples
+            PingMedian = sorted[math.max(1, math.ceil(#sorted * 0.5))]
+            PingP75 = sorted[math.max(1, math.ceil(#sorted * 0.75))]
+            PingMax = sorted[#sorted]
+            PingJitter = math.max(0, PingMax - PingMedian)
+
+            if LegacyPingMs <= 0 then
+                LegacyPingMs = ping
+            else
+                LegacyPingMs = (LegacyPingMs * 4 + ping) / 5
+            end
+
+            CachedPingMs = PingAvg
+        end
+        task.wait(0.2)
+    end
+end)
+
+local function GetPingCompensation()
+    local cfg = getgenv().ParryConfig
+    if not cfg or not cfg.PingCompensationEnabled then return 0 end
+
+    local baselineMs = tonumber(cfg.PingCompensationBaseline) or 0
+    if baselineMs < 0 then baselineMs = 0 end
+
+    local mode = cfg.PingCompensationMode
+    if mode ~= "Legacy" and mode ~= "Stable" and mode ~= "Peak" then
+        mode = "Balanced"
+    end
+
+    local effectiveMs
+    if mode == "Legacy" then
+        effectiveMs = LegacyPingMs
+    elseif mode == "Stable" then
+        effectiveMs = PingAvg
+    elseif mode == "Peak" then
+        effectiveMs = PingMax
+    else
+        -- Balanced: robust high percentile plus half of the recent spike gap,
+        -- capped by the jitter guard so one bad sample cannot over-lead.
+        local guard = tonumber(cfg.PingCompensationJitterGuard)
+        if guard == nil then guard = 50 end
+        if guard < 0 then guard = 0 end
+        effectiveMs = PingP75 + math.min(PingJitter * 0.5, guard)
+    end
+
+    local excessMs = effectiveMs - baselineMs
+    if excessMs < 0 then excessMs = 0 end
+
+    local mult = tonumber(cfg.PingCompensationMultiplier) or 1
+    if mult < 0 then mult = 0 end
+
+    local comp = (excessMs / 1000) * mult
+    comp = comp + math.max(0, tonumber(cfg.PingCompensationExtraLead) or 0) / 1000
+
+    local cap = tonumber(cfg.PingCompensationMax) or 0.5
+    if cap > 0 and comp > cap then comp = cap end
+    if comp < 0 then comp = 0 end
+    return comp
+end
+
+-- ==========================================
+-- FRAME OVERHEAD CORRECTION
+-- ==========================================
+-- Reaction delays are waited out on Heartbeat, so a press always lands somewhere
+-- inside the frame that follows the deadline (0-16ms late at 60 FPS). Learning that
+-- lateness and waking half a frame earlier centres the press on the intended moment
+-- without ever firing before the requested delay.
+local ScheduleLatenessMs = 0
+
+local function RecordScheduleLateness(latenessMs)
+    if type(latenessMs) ~= "number" or latenessMs ~= latenessMs then return end
+    if latenessMs < 0 then latenessMs = 0 end
+    if latenessMs > 60 then latenessMs = 60 end
+    ScheduleLatenessMs = (ScheduleLatenessMs * 0.9) + (latenessMs * 0.1)
+end
+
+local function GetFrameCorrection()
+    local cfg = getgenv().ParryConfig
+    if cfg and cfg.FrameOverheadCorrection == false then return 0 end
+    local ms = ScheduleLatenessMs * 0.5
+    if ms > 12 then ms = 12 end
+    if ms < 0 then ms = 0 end
+    return ms / 1000
+end
+
+-- ==========================================
+-- BLOCK INPUT SYSTEM
+-- ==========================================
+local function TriggerBlockInput()
+    if not getgenv().ParryConfig.BlockInputEnabled then return end
+    
+    local keys = {}
+    if getgenv().ParryConfig.BlockInputM1 then 
+        table.insert(keys, Enum.UserInputType.MouseButton1) 
+    end
+    if getgenv().ParryConfig.BlockInputSkills then 
+        table.insert(keys, Enum.KeyCode.Two)
+        table.insert(keys, Enum.KeyCode.Three)
+        table.insert(keys, Enum.KeyCode.Four)
+        table.insert(keys, Enum.KeyCode.Five)
+    end
+    if getgenv().ParryConfig.BlockInputWeaponSkills then
+        table.insert(keys, Enum.KeyCode.E)
+        table.insert(keys, Enum.KeyCode.R)
+    end
+    
+    if #keys == 0 then return end
+
+    local function sink() 
+        return Enum.ContextActionResult.Sink 
+    end
+    
+    -- Bind at priority 3000 to intercept and block the inputs
+    ContextActionService:BindActionAtPriority("EvtariwareBlock", sink, false, 3000, unpack(keys))
+    
+    local punishTime = getgenv().ParryConfig.BlockInputPunishableTime or 0.5
+    task.delay(punishTime, function()
+        pcall(function()
+            ContextActionService:UnbindAction("EvtariwareBlock")
+        end)
+    end)
+end
+
+-- ==========================================
 -- TRUE DODGE
 -- ==========================================
 local function FireDash()
@@ -151,7 +342,6 @@ local function PlayTrueDodgeAnimation()
     end
 end
 
--- Keybind Execution
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then return end
     if not getgenv().ParryConfig.TrueDodgeEnabled then return end
@@ -222,7 +412,7 @@ local function ExecuteCounter()
 end
 
 -- ==========================================
--- PRECISE COOLDOWNS (PlayerInfo -> WeaponCooldown)
+-- PRECISE COOLDOWNS
 -- ==========================================
 local function GetWeaponCooldownContainer()
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
@@ -233,58 +423,33 @@ end
 
 local function ParseCooldownSeconds(frame)
     if not frame then return nil end
-
-    local timeObj = frame:FindFirstChild("Time")
-    if not timeObj then
-        timeObj = frame:FindFirstChild("Time", true)
-    end
+    local timeObj = frame:FindFirstChild("Time") or frame:FindFirstChild("Time", true)
     if not timeObj then return nil end
-
-    local text = timeObj.Text
-    if text == nil then return nil end
-    text = tostring(text)
-
+    local text = tostring(timeObj.Text)
     local num = tonumber(text)
     if num then return num end
-
     local digits = text:match("(%d+%.?%d*)")
     return digits and tonumber(digits) or nil
 end
 
--- Returns remaining seconds. 0 = ready. nil = UI could not be read.
 local function GetGuiCooldownRemaining(frameName)
     local wc = GetWeaponCooldownContainer()
     if not wc then return nil end
-
     local frame = wc:FindFirstChild(frameName)
     if not frame then return 0 end
-
     local seconds = ParseCooldownSeconds(frame)
     if seconds ~= nil then
         if seconds < 0 then seconds = 0 end
         return seconds
     end
-
-    if frame:IsA("GuiObject") and not frame.Visible then
-        return 0
-    end
-
+    if frame:IsA("GuiObject") and not frame.Visible then return 0 end
     return nil
 end
 
-local function GetParryCooldownRemaining()
-    return GetGuiCooldownRemaining("Parry")
-end
-
-local function GetDashCooldownRemaining()
-    return GetGuiCooldownRemaining("Dash")
-end
-
--- Use the real UI cooldowns when available, otherwise keep the old estimates.
 local function GetCooldownState()
     local now = os.clock()
-    local parryLeft = GetParryCooldownRemaining()
-    local dashLeft = GetDashCooldownRemaining()
+    local parryLeft = GetGuiCooldownRemaining("Parry")
+    local dashLeft = GetGuiCooldownRemaining("Dash")
 
     if parryLeft == nil then
         parryLeft = math.max(0, PARRY_COOLDOWN_TIME - (now - lastParryPress))
@@ -292,42 +457,21 @@ local function GetCooldownState()
     if dashLeft == nil then
         dashLeft = math.max(0, ROLL_KEY_COOLDOWN - (now - lastRollKey))
     end
-
     return parryLeft, dashLeft
 end
 
 local function SelectFallbackAction(enemyChar, allowCounter)
     if allowCounter == nil then allowCounter = true end
-
     local cfg = getgenv().ParryConfig
     local parryLeft, dashLeft = GetCooldownState()
     local counterReady = false
-    if allowCounter then
-        counterReady = GetReadyCounterSlot() ~= nil
-    end
+    if allowCounter then counterReady = GetReadyCounterSlot() ~= nil end
 
-    -- Positional override: if they're behind you, roll when dash is available,
-    -- even if parry itself is ready.
-    if cfg.RollIfBehind and IsOpponentBehind(enemyChar) and dashLeft <= 0 then
-        return "Roll"
-    end
-
-    if allowCounter and cfg.CounterInsteadOfParry and counterReady then
-        return "Counter"
-    end
-
-    if parryLeft <= 0 then
-        return "Parry"
-    end
-
-    if cfg.RollOnParryCooldown and dashLeft <= 0 then
-        return "Roll"
-    end
-
-    if allowCounter and cfg.CounterAsFallback and counterReady then
-        return "Counter"
-    end
-
+    if cfg.RollIfBehind and IsOpponentBehind(enemyChar) and dashLeft <= 0 then return "Roll" end
+    if allowCounter and cfg.CounterInsteadOfParry and counterReady then return "Counter" end
+    if parryLeft <= 0 then return "Parry" end
+    if cfg.RollOnParryCooldown and dashLeft <= 0 then return "Roll" end
+    if allowCounter and cfg.CounterAsFallback and counterReady then return "Counter" end
     return "Parry"
 end
 
@@ -338,92 +482,54 @@ local function ClampPercent(v)
     return v
 end
 
--- Normalizes a pair of exclusive chances. If they total more than 100%,
--- they are scaled down proportionally. Any leftover under 100% belongs to
--- the normal action.
 local function NormalizePair(a, b)
-    a = ClampPercent(a)
-    b = ClampPercent(b)
+    a = ClampPercent(a); b = ClampPercent(b)
     local total = a + b
     if total > 100 then
         local scale = 100 / total
-        a = a * scale
-        b = b * scale
+        a = a * scale; b = b * scale
     end
     return a, b
 end
 
--- Counter chance is deliberately independent of the Humanization toggle.
--- It only needs a counter feature (Auto Counter or Counter Fallback) enabled.
 local function ApplyCounterChance(action, enemyChar)
     if action ~= "Counter" then return action end
-
     local cfg = getgenv().ParryConfig
-    if not (cfg.CounterInsteadOfParry or cfg.CounterAsFallback) then
-        return action
-    end
+    if not (cfg.CounterInsteadOfParry or cfg.CounterAsFallback) then return action end
 
-    local counterChance, missedCounterChance = NormalizePair(
-        cfg.HumanizeCounterChance,
-        cfg.HumanizeMissedCounterChance
-    )
-
+    local counterChance, missedCounterChance = NormalizePair(cfg.HumanizeCounterChance, cfg.HumanizeMissedCounterChance)
     local roll = math.random() * 100
-    if roll < counterChance then
-        return "Counter"
-    elseif roll < counterChance + missedCounterChance then
-        return nil
-    end
-
-    -- Counter was skipped: fall back to the normal defensive action.
+    if roll < counterChance then return "Counter"
+    elseif roll < counterChance + missedCounterChance then return nil end
     return SelectFallbackAction(enemyChar, false)
 end
 
 local function ApplyHumanization(action, enemyChar)
     local cfg = getgenv().ParryConfig
-    if not cfg.HumanizationEnabled or not action then
-        return action
-    end
-
-    if action == "Counter" then
-        return action
-    end
+    if not cfg.HumanizationEnabled or not action then return action end
+    if action == "Counter" then return action end
 
     if action == "Parry" then
-        local rollChance, missChance = NormalizePair(
-            cfg.HumanizeRollChance,
-            cfg.HumanizeMissedReactionChance
-        )
+        local rollChance, missChance = NormalizePair(cfg.HumanizeRollChance, cfg.HumanizeMissedReactionChance)
         local roll = math.random() * 100
-
         if roll < rollChance then
             local _, dashLeft = GetCooldownState()
-            if dashLeft <= 0 then
-                return "Roll"
-            end
+            if dashLeft <= 0 then return "Roll" end
             return "Parry"
-        elseif roll < rollChance + missChance then
-            return nil
-        end
+        elseif roll < rollChance + missChance then return nil end
         return "Parry"
     end
 
     if action == "Roll" then
-        local _, missChance = NormalizePair(
-            cfg.HumanizeRollChance,
-            cfg.HumanizeMissedReactionChance
-        )
-        if math.random() * 100 < missChance then
-            return nil
-        end
+        local _, missChance = NormalizePair(cfg.HumanizeRollChance, cfg.HumanizeMissedReactionChance)
+        if math.random() * 100 < missChance then return nil end
         return "Roll"
     end
-
     return action
 end
 
 -- ==========================================
--- HITBOX (CUBE + SPHERE, CENTERED ON HRP)
+-- HITBOX
 -- ==========================================
 local VALID_SHAPES = { Cube = true, Sphere = true }
 
@@ -436,18 +542,12 @@ local function NormalizeHitbox(hb, legacy)
     if type(hb) ~= "table" then return MakeDefaultHitbox(legacy) end
     local d = MakeDefaultHitbox(legacy)
     local size = d.Size
-    if hb.SizeX and hb.SizeY and hb.SizeZ then
-        size = (hb.SizeX + hb.SizeY + hb.SizeZ) / 3
-    elseif hb.Size then
-        size = tonumber(hb.Size) or d.Size
-    end
+    if hb.SizeX and hb.SizeY and hb.SizeZ then size = (hb.SizeX + hb.SizeY + hb.SizeZ) / 3
+    elseif hb.Size then size = tonumber(hb.Size) or d.Size end
     local shape = hb.Shape
-    if type(shape) ~= "string" or not VALID_SHAPES[shape] then
-        shape = d.Shape
-    end
+    if type(shape) ~= "string" or not VALID_SHAPES[shape] then shape = d.Shape end
     return {
-        Size = size,
-        Shape = shape,
+        Size = size, Shape = shape,
         ColorR = tonumber(hb.ColorR) or d.ColorR,
         ColorG = tonumber(hb.ColorG) or d.ColorG,
         ColorB = tonumber(hb.ColorB) or d.ColorB,
@@ -469,9 +569,7 @@ local function IsEnemyInHitbox(enemyChar, hitbox)
     if hb.Shape == "Sphere" then
         return relPos.Magnitude <= half
     else
-        return math.abs(relPos.X) <= half
-           and math.abs(relPos.Y) <= half
-           and math.abs(relPos.Z) <= half
+        return math.abs(relPos.X) <= half and math.abs(relPos.Y) <= half and math.abs(relPos.Z) <= half
     end
 end
 
@@ -507,9 +605,7 @@ local function StartHitboxVisualizer()
         local size = hb.Size or 25
         local wantShape = (hb.Shape == "Sphere") and Enum.PartType.Ball or Enum.PartType.Block
 
-        if HitboxVisualizerPart.Shape ~= wantShape then
-            HitboxVisualizerPart.Shape = wantShape
-        end
+        if HitboxVisualizerPart.Shape ~= wantShape then HitboxVisualizerPart.Shape = wantShape end
         HitboxVisualizerPart.Size = Vector3.new(size, size, size)
         HitboxVisualizerPart.Transparency = hb.Transparency
         HitboxVisualizerPart.Color = Color3.new(hb.ColorR, hb.ColorG, hb.ColorB)
@@ -554,7 +650,7 @@ local function PreviewAnimation(animId)
 end
 
 -- ==========================================
--- BLACKLIST SYSTEM
+-- BLACKLIST & TIMING FILES
 -- ==========================================
 local function SaveBlacklist()
     local arr = {}
@@ -575,9 +671,6 @@ local function IsBlacklisted(id) return getgenv().ParryConfig.Blacklist[tostring
 local function AddBlacklist(id) if id and id ~= "" then getgenv().ParryConfig.Blacklist[tostring(id)] = true; SaveBlacklist(); return true end return false end
 local function RemoveBlacklist(id) if id then getgenv().ParryConfig.Blacklist[tostring(id)] = nil; SaveBlacklist(); return true end return false end
 
--- ==========================================
--- TIMING SYSTEM
--- ==========================================
 local timingFileAnimCache = {}
 
 local function SaveTimingFile(name, animId, points, hitbox)
@@ -597,17 +690,12 @@ local function LoadTimingFile(name)
     if not isfile(path) then return nil end
     local ok, dec = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     if not ok or not dec or not dec.AnimId then return nil end
-    
     local points = dec.Points
-    if not points then
-        points = { {Name="Point1", Action=dec.Action or "Parry", Delay=dec.Delay or 0.15} }
-    end
+    if not points then points = { {Name="Point1", Action=dec.Action or "Parry", Delay=dec.Delay or 0.15} } end
 
     getgenv().ParryConfig.Profiles[dec.AnimId] = {
-        Name = dec.Name or name, 
-        Points = points, 
-        Hitbox = NormalizeHitbox(dec.Hitbox, dec.HitboxSize), 
-        Enabled = true
+        Name = dec.Name or name, Points = points, 
+        Hitbox = NormalizeHitbox(dec.Hitbox, dec.HitboxSize), Enabled = true
     }
     timingFileAnimCache[name] = dec.AnimId
     return dec
@@ -634,9 +722,7 @@ local function ListTimingFiles()
                 end
                 if id and id ~= false then
                     if not seenID[id] then seenID[id] = true; table.insert(l, name) end
-                else
-                    table.insert(l, name)
-                end
+                else table.insert(l, name) end
             end
         end
     end
@@ -696,12 +782,8 @@ local function SendRollKey()
     if now - lastRollKey < ROLL_KEY_COOLDOWN then return false end
     lastRollKey = now
     VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Q, false, game)
-    -- Release the key without blocking, so the roll-cancel timer starts at the
-    -- actual moment the roll was pressed.
     task.delay(0.05, function()
-        pcall(function()
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game)
-        end)
+        pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game) end)
     end)
     return true
 end
@@ -709,31 +791,19 @@ end
 local function ExecuteParry() if SendParryKey() then lastParryPress = os.clock(); return true end return false end
 local function ExecuteRoll() return SendRollKey() end
 
--- Roll cancel in this game is a right-click CLICK (press + release). The
--- DashCancel remote does nothing, and a press without the release does nothing.
 local function ExecuteRollCancel()
-    if type(mouse2click) == "function" then
-        if pcall(mouse2click) then return true end
-    end
-
+    if type(mouse2click) == "function" then if pcall(mouse2click) then return true end end
     if type(mouse2press) == "function" then
         if pcall(mouse2press) then
-            task.delay(0.05, function()
-                if type(mouse2release) == "function" then pcall(mouse2release) end
-            end)
+            task.delay(0.05, function() if type(mouse2release) == "function" then pcall(mouse2release) end end)
             return true
         end
     end
-
     local loc = UserInputService:GetMouseLocation()
-    local ok = pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, true, game, 1)
-    end)
+    local ok = pcall(function() VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, true, game, 1) end)
     if ok then
         task.delay(0.05, function()
-            pcall(function()
-                VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, false, game, 1)
-            end)
+            pcall(function() VirtualInputManager:SendMouseButtonEvent(loc.X, loc.Y, 2, false, game, 1) end)
         end)
     end
     return ok
@@ -741,21 +811,11 @@ end
 
 local function ExecuteAction(action)
     if action == "Roll" then
-        if not ExecuteRoll() then
-            -- The roll key was throttled, so nothing is rolling. Parry instead
-            -- of firing a cancel into nothing.
-            ExecuteParry()
-            return "Parry"
-        end
-
-        -- Roll cancel belongs to the roll itself, so it is scheduled here, at
-        -- the moment the roll key is sent, regardless of what caused the roll.
+        if not ExecuteRoll() then ExecuteParry(); return "Parry" end
         if getgenv().ParryConfig.AutoRollCancel then
             local cancelDelay = tonumber(getgenv().ParryConfig.RollCancelDelay) or 0
             if cancelDelay < 0 then cancelDelay = 0 end
             task.delay(cancelDelay, function()
-                -- A zero delay should still cancel, but the dash has to be
-                -- registered first, so give it one frame.
                 if cancelDelay <= 0 then task.wait() end
                 pcall(ExecuteRollCancel)
             end)
@@ -803,9 +863,7 @@ local function OnAnimationPlayed(humanoid, track)
                 local myChar = LocalPlayer.Character
                 local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
                 local enemyHrp = char:FindFirstChild("HumanoidRootPart")
-                if myHrp and enemyHrp and (myHrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.LoggerMaxDistance then
-                    skip = true
-                end
+                if myHrp and enemyHrp and (myHrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.LoggerMaxDistance then skip = true end
             end
             if not skip then
                 local cleanId = GetCleanAnimId(tostring(track.Animation.AnimationId))
@@ -837,20 +895,14 @@ local function OnAnimationPlayed(humanoid, track)
         if not (profile and profile.Enabled) then return end
 
         local pointsToRun = {}
-        
         if getgenv().ParryConfig.DefendSelectedPointEnabled then
             if cleanId == getgenv().ParryConfig.SelectedAnimId then
                 for _, pt in ipairs(profile.Points) do
-                    if pt.Name == getgenv().ParryConfig.SelectedPointName then
-                        table.insert(pointsToRun, pt)
-                        break
-                    end
+                    if pt.Name == getgenv().ParryConfig.SelectedPointName then table.insert(pointsToRun, pt); break end
                 end
             end
         elseif getgenv().ParryConfig.DefendSelectedTimingEnabled then
-            if cleanId == getgenv().ParryConfig.SelectedAnimId then
-                pointsToRun = profile.Points
-            end
+            if cleanId == getgenv().ParryConfig.SelectedAnimId then pointsToRun = profile.Points end
         elseif getgenv().ParryConfig.Enabled then
             pointsToRun = profile.Points
         end
@@ -858,9 +910,6 @@ local function OnAnimationPlayed(humanoid, track)
         if #pointsToRun == 0 then return end
 
         local hb = profile.Hitbox or MakeDefaultHitbox(profile.HitboxSize or 25)
-        -- Don't range-check here. An attack can start outside the hitbox and
-        -- move into range during its windup. Range is validated at the actual
-        -- reaction point inside each spawned point task below.
 
         for _, pt in ipairs(pointsToRun) do
             task.spawn(function()
@@ -868,39 +917,51 @@ local function OnAnimationPlayed(humanoid, track)
 
                 local timePassed = track.TimePosition or 0
                 local targetDelay = (pt.Delay or 0.15) + (getgenv().ParryConfig.GlobalDelayOffset / 1000)
-                
-                if timePassed > targetDelay then
-                    return
-                end
+
+                -- A late animation event (lag / ping spike) used to drop the point
+                -- entirely. Allow a small grace window so the reaction still fires
+                -- immediately instead of being skipped.
+                local lateGrace = tonumber(getgenv().ParryConfig.LateReactionGrace)
+                if lateGrace == nil then lateGrace = 100 end
+                if lateGrace < 0 then lateGrace = 0 end
+
+                if timePassed > targetDelay + (lateGrace / 1000) then return end
 
                 local baseDelay = targetDelay - timePassed
+                if baseDelay < 0 then baseDelay = 0 end
+                local pingComp = GetPingCompensation()
+                local compensatedDelay = baseDelay - pingComp
+                if compensatedDelay < 0 then compensatedDelay = 0 end
 
                 local willBeCounter = false
+                local willBeRoll = false
                 if (pt.Action or "Parry") == "Parry" then
                     local cfg = getgenv().ParryConfig
                     local parryCDLeft, rollCDLeft = GetCooldownState()
                     local counterReady = GetReadyCounterSlot() ~= nil
-                    local parryReadyAtTrigger = parryCDLeft <= baseDelay
-                    local dashReadyAtTrigger = rollCDLeft <= baseDelay
+                    local parryReadyAtTrigger = parryCDLeft <= compensatedDelay
+                    local dashReadyAtTrigger = rollCDLeft <= compensatedDelay
                     local rollBehind = cfg.RollIfBehind and IsOpponentBehind(char) and dashReadyAtTrigger
 
-                    if not rollBehind then
-                        if cfg.CounterInsteadOfParry and counterReady then
-                            willBeCounter = true
+                    if rollBehind then willBeRoll = true
+                    else
+                        if cfg.CounterInsteadOfParry and counterReady then willBeCounter = true
                         elseif cfg.CounterAsFallback and counterReady then
                             local rollOnCD = cfg.RollOnParryCooldown and dashReadyAtTrigger
-                            if not parryReadyAtTrigger and not rollOnCD then
-                                willBeCounter = true
-                            end
+                            if not parryReadyAtTrigger and not rollOnCD then willBeCounter = true end
                         end
+                        if not willBeCounter and not parryReadyAtTrigger and cfg.RollOnParryCooldown and dashReadyAtTrigger then willBeRoll = true end
                     end
                 end
 
-                local delay = baseDelay
-                if willBeCounter then
-                    delay = delay + (getgenv().ParryConfig.CounterDelayOffset or 0)
-                    if delay < 0 then delay = 0 end
-                end
+                local delay = compensatedDelay
+                if willBeCounter then delay = delay + (getgenv().ParryConfig.CounterDelayOffset or 0)
+                elseif willBeRoll then delay = delay + (getgenv().ParryConfig.RollDelayOffset or 0) end
+
+                -- Remove the machine's own wake-up lateness so the press is not
+                -- systematically late by a frame on top of the ping lead.
+                delay = delay - GetFrameCorrection()
+                if delay < 0 then delay = 0 end
 
                 if getgenv().ParryConfig.HumanizationEnabled then
                     local jitter = math.floor(tonumber(getgenv().ParryConfig.HumanizeReactionJitter) or 0)
@@ -911,11 +972,20 @@ local function OnAnimationPlayed(humanoid, track)
                 end
 
                 local startClock = os.clock()
+                local fireClock = startClock + delay
                 local shouldFire = true
                 local triggeredEarly = false
-                
+                local reachedDeadline = false
+                local didWait = false
+
+                -- Wait on Heartbeat while re-validating the attack every frame
                 if delay > 0 then
-                    while os.clock() - startClock < delay do
+                    while true do
+                        if os.clock() >= fireClock then
+                            reachedDeadline = true
+                            break
+                        end
+
                         if FeintedTracks[track] then
                             shouldFire = false
                             break
@@ -924,19 +994,12 @@ local function OnAnimationPlayed(humanoid, track)
                         if not track.IsPlaying then
                             if getgenv().ParryConfig.ReactToFeints and IsFeintPlaying(char) then
                                 FeintedTracks[track] = true
-
                                 local reactChance = 100
-                                if getgenv().ParryConfig.HumanizationEnabled then
-                                    reactChance = ClampPercent(getgenv().ParryConfig.HumanizeReactToFeintChance)
-                                end
-
-                                if math.random() * 100 < reactChance then
-                                    triggeredEarly = true
-                                else
-                                    shouldFire = false
-                                end
+                                if getgenv().ParryConfig.HumanizationEnabled then reactChance = ClampPercent(getgenv().ParryConfig.HumanizeReactToFeintChance) end
+                                if math.random() * 100 < reactChance then triggeredEarly = true else shouldFire = false end
                                 break
                             else
+                                -- REVERTED FIX #1: Cancel parry if animation stops early (prevents reacting to cancelled moves/feints)
                                 shouldFire = false
                                 break
                             end
@@ -946,42 +1009,47 @@ local function OnAnimationPlayed(humanoid, track)
                             shouldFire = false
                             break
                         end
-                        task.wait()
+                        didWait = true
+                        RunService.Heartbeat:Wait()
                     end
                 end
 
-                if not shouldFire then return end
-                if not triggeredEarly and not track.IsPlaying then return end
-
-                -- Validate range at the moment the parry actually fires.
-                -- This allows "started outside, entered the hitbox during the
-                -- animation" reactions.
-                if not IsEnemyInHitbox(char, hb) then
-                    return
+                -- Learn how late this machine's frame wake-up is
+                if reachedDeadline and didWait then
+                    RecordScheduleLateness((os.clock() - fireClock) * 1000)
                 end
 
-                -- Apply the optional max-distance limit at reaction time too,
-                -- instead of only at animation start.
+                if not shouldFire then return end
+                -- REVERTED FIX #1: Double check track is still playing
+                if not triggeredEarly and not track.IsPlaying then return end
+
+                -- REVERTED FIX #3: Strictly use user-defined hitbox multiplier
+                local hitboxSize = hb.Size * (getgenv().ParryConfig.GlobalHitboxMultiplier or 1)
+                local checkHb = {Size = hitboxSize, Shape = hb.Shape}
+                if not IsEnemyInHitbox(char, checkHb) then return end
+
                 if getgenv().ParryConfig.LimitMaxDistance then
                     local myChar = LocalPlayer.Character
                     local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
                     local enemyHrp = char:FindFirstChild("HumanoidRootPart")
                     if not myHrp or not enemyHrp then return end
-                    if (myHrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.MaxDistance then
-                        return
-                    end
+                    if (myHrp.Position - enemyHrp.Position).Magnitude > getgenv().ParryConfig.MaxDistance then return end
                 end
 
                 local action = pt.Action or "Parry"
-
-                if action == "Parry" then
-                    action = SelectFallbackAction(char)
-                end
-
+                if action == "Parry" then action = SelectFallbackAction(char) end
                 action = ApplyCounterChance(action, char)
                 action = ApplyHumanization(action, char)
 
                 if action then
+                    -- Trigger Block Input if enemy is within block hitbox
+                    if getgenv().ParryConfig.BlockInputEnabled then
+                        local blockHbSize = 25 * (getgenv().ParryConfig.BlockInputHitboxMultiplier or 1)
+                        if IsEnemyInHitbox(char, {Size = blockHbSize, Shape = "Cube"}) then
+                            TriggerBlockInput()
+                        end
+                    end
+                    
                     ExecuteAction(action)
                 end
             end)
@@ -992,10 +1060,7 @@ end
 local function HookCharacter(player, char)
     task.spawn(function()
         if not char then return end
-        local hum = char:WaitForChild("Humanoid", 10)
-        if not hum then
-            hum = char:FindFirstChildOfClass("AnimationController")
-        end
+        local hum = char:WaitForChild("Humanoid", 10) or char:FindFirstChildOfClass("AnimationController")
         if not hum then return end
 
         local anim = hum:WaitForChild("Animator", 10)
@@ -1003,9 +1068,7 @@ local function HookCharacter(player, char)
             anim.AnimationPlayed:Connect(function(t) pcall(OnAnimationPlayed, hum, t) end)
         else
             hum.ChildAdded:Connect(function(c)
-                if c:IsA("Animator") then
-                    c.AnimationPlayed:Connect(function(t) pcall(OnAnimationPlayed, hum, t) end)
-                end
+                if c:IsA("Animator") then c.AnimationPlayed:Connect(function(t) pcall(OnAnimationPlayed, hum, t) end) end
             end)
         end
     end)
@@ -1044,22 +1107,44 @@ local uiSuccess, uiErr = pcall(function()
     local originalSaveName = ""
     local currentPoints = {}
 
+    local function FormatDelay(d)
+        return tostring(tonumber(d) or 0)
+    end
+
+    local function RenumberPoints()
+        for i, pt in ipairs(currentPoints) do
+            pt.Name = "Point" .. i
+        end
+    end
+
+    local function GetNextPointName()
+        local used = {}
+        for _, pt in ipairs(currentPoints) do used[pt.Name] = true end
+        local i = 1
+        while used["Point" .. i] do i = i + 1 end
+        return "Point" .. i
+    end
+
     local function RefreshPointsDropdown(selectName)
         local list = {}
-        for _, pt in ipairs(currentPoints) do
-            table.insert(list, string.format("%s|%s|%.2f", pt.Name, pt.Action, pt.Delay))
+        for _, pt in ipairs(currentPoints) do table.insert(list, string.format("%s|%s|%s", pt.Name, pt.Action, FormatDelay(pt.Delay))) end
+        if #list == 0 then
+            table.insert(list, "No Points")
+            if PointsDD then
+                pcall(function()
+                    PointsDD:SetValues(list)
+                    PointsDD:SetValue("No Points")
+                end)
+            end
+            return
         end
-        if #list == 0 then table.insert(list, "No Points") end
         
         if PointsDD then
             pcall(function()
                 PointsDD:SetValues(list)
                 if selectName then
                     for _, v in ipairs(list) do
-                        if string.find(v, "^" .. selectName .. "|") then
-                            PointsDD:SetValue(v)
-                            break
-                        end
+                        if string.find(v, "^" .. selectName .. "|") then PointsDD:SetValue(v); break end
                     end
                 end
             end)
@@ -1073,9 +1158,7 @@ local uiSuccess, uiErr = pcall(function()
 
         local p = getgenv().ParryConfig.Profiles[animId]
         if p then
-            originalSaveName = p.Name
-            saveName = p.Name
-
+            originalSaveName = p.Name; saveName = p.Name
             isUpdatingTimingUI = true
             if Options.TimingNameInput then Options.TimingNameInput:SetValue(p.Name) end
             isUpdatingTimingUI = false
@@ -1086,22 +1169,17 @@ local uiSuccess, uiErr = pcall(function()
                 Options.HitboxSizeInput:SetValue(tostring(currentHitbox.Size))
                 Options.HitboxShape:SetValue(currentHitbox.Shape)
                 Options.HitboxTransparency:SetValue(currentHitbox.Transparency)
-                if Options.HitboxVisualizerToggle and Options.HitboxVisualizerToggle.Value then
-                    StartHitboxVisualizer()
-                end
+                if Options.HitboxVisualizerToggle and Options.HitboxVisualizerToggle.Value then StartHitboxVisualizer() end
             end
 
             currentPoints = {}
-            for _, pt in ipairs(p.Points) do
-                table.insert(currentPoints, {Name = pt.Name, Action = pt.Action, Delay = pt.Delay})
-            end
+            for _, pt in ipairs(p.Points) do table.insert(currentPoints, {Name = pt.Name, Action = pt.Action, Delay = pt.Delay}) end
+            RenumberPoints()
             RefreshPointsDropdown(currentPoints[1] and currentPoints[1].Name)
         else
-            originalSaveName = ""
-            saveName = ""
+            originalSaveName = ""; saveName = ""
             if Options.TimingNameInput then Options.TimingNameInput:SetValue("") end
-            currentPoints = {}
-            RefreshPointsDropdown()
+            currentPoints = {}; RefreshPointsDropdown()
         end
     end
 
@@ -1112,83 +1190,102 @@ local uiSuccess, uiErr = pcall(function()
     Assist:AddToggle('ADM', {Text = 'Auto Defense', Default = false, Callback = function(v) getgenv().ParryConfig.Enabled = v end})
     Assist:AddToggle('ROC', {Text = 'Roll If Parry On Cooldown', Default = false, Callback = function(v) getgenv().ParryConfig.RollOnParryCooldown = v end})
     Assist:AddToggle('RIB', {Text = 'Roll If Opponent Is Behind You', Default = false, Callback = function(v) getgenv().ParryConfig.RollIfBehind = v end})
-    Assist:AddToggle('ARC', {Text = 'Roll Cancel', Default = false, Callback = function(v) getgenv().ParryConfig.AutoRollCancel = v end})
-    Assist:AddToggle('RTF', {Text = 'React to Feints', Default = false, Callback = function(v) getgenv().ParryConfig.ReactToFeints = v end})
-    
-    Assist:AddSlider('RCD', {Text = 'Roll Cancel Delay', Default = 0.2, Min = 0, Max = 1, Rounding = 3, Callback = function(v) 
-        getgenv().ParryConfig.RollCancelDelay = v 
-        if not isUpdatingUI and Options.RCDInput then
-            isUpdatingUI = true
-            Options.RCDInput:SetValue(tostring(v))
-            isUpdatingUI = false
-        end
+
+    Assist:AddSlider('RDO', {Text = 'Roll Delay Offset', Default = 0, Min = -1, Max = 1, Rounding = 3, Callback = function(v)
+        getgenv().ParryConfig.RollDelayOffset = v
+        if not isUpdatingUI and Options.RDOInput then isUpdatingUI = true; Options.RDOInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
-    Assist:AddInput('RCDInput', {Default = '0.2', Text = 'Precise Roll Cancel Delay', Placeholder = 'e.g. 0.25', Finished = true, Callback = function(v)
+    Assist:AddInput('RDOInput', {Default = '0', Text = 'Precise Roll Delay Offset', Placeholder = 'e.g. -0.1', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
-            getgenv().ParryConfig.RollCancelDelay = num
-            if not isUpdatingUI and Options.RCD then
-                isUpdatingUI = true
-                Options.RCD:SetValue(num)
-                isUpdatingUI = false
-            end
+            getgenv().ParryConfig.RollDelayOffset = num
+            if not isUpdatingUI and Options.RDO then isUpdatingUI = true; Options.RDO:SetValue(num); isUpdatingUI = false end
         end
     end})
 
-    local DodgeGroup = Tabs.Combat:AddLeftGroupbox('Dodge')
+    Assist:AddToggle('ARC', {Text = 'Roll Cancel', Default = false, Callback = function(v) getgenv().ParryConfig.AutoRollCancel = v end})
+    Assist:AddToggle('RTF', {Text = 'React to Feints', Default = false, Callback = function(v) getgenv().ParryConfig.ReactToFeints = v end})
+    
+    Assist:AddSlider('RCD', {Text = 'Roll Cancel Delay', Default = 0.1, Min = 0, Max = 1, Rounding = 3, Callback = function(v) 
+        getgenv().ParryConfig.RollCancelDelay = v 
+        if not isUpdatingUI and Options.RCDInput then isUpdatingUI = true; Options.RCDInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    Assist:AddInput('RCDInput', {Default = '0.1', Text = 'Precise Roll Cancel Delay', Placeholder = 'e.g. 0.25', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.RollCancelDelay = num
+            if not isUpdatingUI and Options.RCD then isUpdatingUI = true; Options.RCD:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+
+    -- BLOCK INPUT GROUP (moved under Assistance)
+    local BlockGroup = Tabs.Combat:AddLeftGroupbox('Block Input')
+    BlockGroup:AddToggle('BI', {Text = 'Enable Block Input', Default = false, Callback = function(v) getgenv().ParryConfig.BlockInputEnabled = v end})
+    BlockGroup:AddSlider('BIHB', {Text = 'Block Hitbox Multiplier', Default = 1, Min = 0.1, Max = 5, Rounding = 2, Callback = function(v)
+        getgenv().ParryConfig.BlockInputHitboxMultiplier = v
+        if not isUpdatingUI and Options.BIHBInput then isUpdatingUI = true; Options.BIHBInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    BlockGroup:AddInput('BIHBInput', {Default = '1', Text = 'Precise Block Hitbox Mult', Placeholder = 'e.g. 1.5', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.BlockInputHitboxMultiplier = num
+            if not isUpdatingUI and Options.BIHB then isUpdatingUI = true; Options.BIHB:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+    BlockGroup:AddSlider('BIPT', {Text = 'Punishable Time (Seconds)', Default = 0.5, Min = 0, Max = 2, Rounding = 2, Callback = function(v)
+        getgenv().ParryConfig.BlockInputPunishableTime = v
+        if not isUpdatingUI and Options.BIPTInput then isUpdatingUI = true; Options.BIPTInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    BlockGroup:AddInput('BIPTInput', {Default = '0.5', Text = 'Precise Punishable Time', Placeholder = 'e.g. 0.5', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.BlockInputPunishableTime = num
+            if not isUpdatingUI and Options.BIPT then isUpdatingUI = true; Options.BIPT:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+    BlockGroup:AddDropdown('BIBlock', {
+        Values = {'M1s', 'Skills (2,3,4,5)', 'Weapon Skills (E,R)'},
+        Default = {'M1s', 'Skills (2,3,4,5)', 'Weapon Skills (E,R)'},
+        Multi = true,
+        Text = 'What to Block',
+        Callback = function(v)
+            getgenv().ParryConfig.BlockInputM1 = false
+            getgenv().ParryConfig.BlockInputSkills = false
+            getgenv().ParryConfig.BlockInputWeaponSkills = false
+            for _, val in pairs(v) do
+                if val == 'M1s' then getgenv().ParryConfig.BlockInputM1 = true end
+                if val == 'Skills (2,3,4,5)' then getgenv().ParryConfig.BlockInputSkills = true end
+                if val == 'Weapon Skills (E,R)' then getgenv().ParryConfig.BlockInputWeaponSkills = true end
+            end
+        end
+    })
+
+    local DodgeGroup = Tabs.Combat:AddLeftGroupbox('True Dodge')
     DodgeGroup:AddToggle('TDE', {Text = 'Enable True Dodge', Default = false, Callback = function(v) getgenv().ParryConfig.TrueDodgeEnabled = v end})
     
     local keySuccess = pcall(function()
         if DodgeGroup.AddKeyPicker then
-            DodgeGroup:AddKeyPicker('TrueDodgeKey', {
-                Default = 'P',
-                SyncToggleState = false,
-                Mode = 'Press',
-                Text = 'Dodge Keybind',
-                NoUI = false
-            })
+            DodgeGroup:AddKeyPicker('TrueDodgeKey', {Default = 'P', SyncToggleState = false, Mode = 'Press', Text = 'Dodge Keybind', NoUI = false})
         elseif DodgeGroup.AddKeybind then
-            DodgeGroup:AddKeybind('TrueDodgeKey', {
-                Default = 'P',
-                SyncToggleState = false,
-                Mode = 'Press',
-                Text = 'Dodge Keybind',
-                NoUI = false
-            })
-        else
-            error("AddKeyPicker missing")
-        end
+            DodgeGroup:AddKeybind('TrueDodgeKey', {Default = 'P', SyncToggleState = false, Mode = 'Press', Text = 'Dodge Keybind', NoUI = false})
+        else error("AddKeyPicker missing") end
     end)
-    if not keySuccess then
-        DodgeGroup:AddInput('TrueDodgeKey', {Default = 'P', Text = 'Dodge Keybind', Finished = true})
-    end
-
+    if not keySuccess then DodgeGroup:AddInput('TrueDodgeKey', {Default = 'P', Text = 'Dodge Keybind', Finished = true}) end
     DodgeGroup:AddToggle('TDA', {Text = 'True Dodge Animation', Default = false, Callback = function(v) getgenv().ParryConfig.TrueDodgeAnimation = v end})
 
-    -- ==========================================
     -- HUMANIZATION SUBTAB
-    -- ==========================================
     local HumanGroup
-    local hasLeftTabbox = type(Tabs.Combat.AddLeftTabbox) == "function"
-    if hasLeftTabbox then
+    if type(Tabs.Combat.AddLeftTabbox) == "function" then
         local ok, box = pcall(function() return Tabs.Combat:AddLeftTabbox() end)
         if ok and box then
             local ok2, tab = pcall(function() return box:AddTab('Humanization') end)
-            if ok2 and tab then
-                HumanGroup = tab
-            end
+            if ok2 and tab then HumanGroup = tab end
         end
     end
-    if not HumanGroup then
-        HumanGroup = Tabs.Combat:AddLeftGroupbox('Humanization')
-    end
+    if not HumanGroup then HumanGroup = Tabs.Combat:AddLeftGroupbox('Humanization') end
 
-    HumanGroup:AddToggle('HUMAN', {
-        Text = 'Humanization',
-        Default = false,
-        Callback = function(v) getgenv().ParryConfig.HumanizationEnabled = v end
-    })
-    -- Live readout of the normalized percentages.
+    HumanGroup:AddToggle('HUMAN', {Text = 'Humanization', Default = false, Callback = function(v) getgenv().ParryConfig.HumanizationEnabled = v end})
+    
     local FillLabel, CntLabel
     local okLbl1, l1 = pcall(function() return HumanGroup:AddLabel('Roll 0% / Miss 0% / Parry 100%') end)
     if okLbl1 then FillLabel = l1 end
@@ -1201,164 +1298,162 @@ local uiSuccess, uiErr = pcall(function()
         local ch, cm = NormalizePair(cfg.HumanizeCounterChance, cfg.HumanizeMissedCounterChance)
         local parryLeft = 100 - pr - pm
         if parryLeft < 0 then parryLeft = 0 end
-        if FillLabel then
-            pcall(function()
-                FillLabel:SetText(string.format('Roll %.0f%% / Miss %.0f%% / Parry %.0f%%', pr, pm, parryLeft))
-            end)
-        end
-        if CntLabel then
-            pcall(function()
-                CntLabel:SetText(string.format('Counter %.0f%% / Miss %.0f%%', ch, cm))
-            end)
-        end
+        if FillLabel then pcall(function() FillLabel:SetText(string.format('Roll %.0f%% / Miss %.0f%% / Parry %.0f%%', pr, pm, parryLeft)) end) end
+        if CntLabel then pcall(function() CntLabel:SetText(string.format('Counter %.0f%% / Miss %.0f%%', ch, cm)) end) end
     end
 
-    HumanGroup:AddSlider('HROLL', {
-        Text = 'Roll Instead of Parry %',
-        Default = 0, Min = 0, Max = 100, Rounding = 0,
-        Callback = function(v)
-            getgenv().ParryConfig.HumanizeRollChance = v
-            UpdateHumanReadout()
-        end
-    })
-    HumanGroup:AddSlider('HMISS', {
-        Text = 'Missed Reaction %',
-        Default = 0, Min = 0, Max = 100, Rounding = 0,
-        Callback = function(v)
-            getgenv().ParryConfig.HumanizeMissedReactionChance = v
-            UpdateHumanReadout()
-        end
-    })
-    HumanGroup:AddSlider('HFEINT', {
-        Text = 'React to Feint %',
-        Default = 0, Min = 0, Max = 100, Rounding = 0,
-        Callback = function(v) getgenv().ParryConfig.HumanizeReactToFeintChance = v end
-    })
-    HumanGroup:AddSlider('HJITTER', {
-        Text = 'Reaction Jitter ms',
-        Default = 0, Min = 0, Max = 200, Rounding = 0,
-        Callback = function(v) getgenv().ParryConfig.HumanizeReactionJitter = v end
-    })
+    HumanGroup:AddSlider('HROLL', {Text = 'Roll Instead of Parry %', Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeRollChance = v; UpdateHumanReadout() end})
+    HumanGroup:AddSlider('HMISS', {Text = 'Missed Reaction %', Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeMissedReactionChance = v; UpdateHumanReadout() end})
+    HumanGroup:AddSlider('HFEINT', {Text = 'React to Feint %', Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeReactToFeintChance = v end})
+    HumanGroup:AddSlider('HJITTER', {Text = 'Reaction Jitter ms', Default = 0, Min = 0, Max = 200, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeReactionJitter = v end})
 
     local Glob = Tabs.Combat:AddRightGroupbox('Global Parameters')
-    
     Glob:AddSlider('GD', {Text = 'Global Delay Offset', Default = 0, Min = -100, Max = 100, Rounding = 0, Callback = function(v) 
         getgenv().ParryConfig.GlobalDelayOffset = v 
-        if not isUpdatingUI and Options.GDInput then
-            isUpdatingUI = true
-            Options.GDInput:SetValue(tostring(v))
-            isUpdatingUI = false
-        end
+        if not isUpdatingUI and Options.GDInput then isUpdatingUI = true; Options.GDInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
     Glob:AddInput('GDInput', {Default = '0', Text = 'Precise Global Delay Offset', Placeholder = 'e.g. -50', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
             getgenv().ParryConfig.GlobalDelayOffset = num
-            if not isUpdatingUI and Options.GD then
-                isUpdatingUI = true
-                Options.GD:SetValue(num)
-                isUpdatingUI = false
-            end
+            if not isUpdatingUI and Options.GD then isUpdatingUI = true; Options.GD:SetValue(num); isUpdatingUI = false end
         end
     end})
 
     Glob:AddToggle('LimitDist', {Text = 'Enable Max Distance Check', Default = false, Callback = function(v) getgenv().ParryConfig.LimitMaxDistance = v end})
-    
     Glob:AddSlider('MD', {Text = 'Max Auto-Parry Distance', Default = 50, Min = 5, Max = 200, Rounding = 0, Callback = function(v) 
         getgenv().ParryConfig.MaxDistance = v 
-        if not isUpdatingUI and Options.MDInput then
-            isUpdatingUI = true
-            Options.MDInput:SetValue(tostring(v))
-            isUpdatingUI = false
-        end
+        if not isUpdatingUI and Options.MDInput then isUpdatingUI = true; Options.MDInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
     Glob:AddInput('MDInput', {Default = '50', Text = 'Precise Max Auto-Parry Distance', Placeholder = 'e.g. 100', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
             getgenv().ParryConfig.MaxDistance = num
-            if not isUpdatingUI and Options.MD then
-                isUpdatingUI = true
-                Options.MD:SetValue(num)
-                isUpdatingUI = false
-            end
+            if not isUpdatingUI and Options.MD then isUpdatingUI = true; Options.MD:SetValue(num); isUpdatingUI = false end
         end
     end})
+
+    Glob:AddSlider('GloHB', {Text = 'Global Hitbox Multiplier', Default = 1, Min = 0.1, Max = 5, Rounding = 2, Callback = function(v) 
+        getgenv().ParryConfig.GlobalHitboxMultiplier = v 
+        if not isUpdatingUI and Options.GloHBInput then isUpdatingUI = true; Options.GloHBInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    Glob:AddInput('GloHBInput', {Default = '1', Text = 'Precise Hitbox Multiplier', Placeholder = 'e.g. 1.5', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.GlobalHitboxMultiplier = num
+            if not isUpdatingUI and Options.GloHB then isUpdatingUI = true; Options.GloHB:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+
+    -- Ping Compensation
+    pcall(function() Glob:AddLabel('Ping Compensation') end)
+    Glob:AddToggle('PingComp', {Text = 'Enable Ping Compensation', Default = false, Callback = function(v) getgenv().ParryConfig.PingCompensationEnabled = v end})
+    Glob:AddDropdown('PingCompMode', {Text = 'Compensation Mode', Values = {'Legacy', 'Stable', 'Balanced', 'Peak'}, Default = 'Balanced', Multi = false, Callback = function(v)
+        getgenv().ParryConfig.PingCompensationMode = v
+    end})
+    Glob:AddSlider('PingCompMult', {Text = 'Compensation Multiplier', Default = 1, Min = 0, Max = 2, Rounding = 2, Callback = function(v)
+        getgenv().ParryConfig.PingCompensationMultiplier = v
+        if not isUpdatingUI and Options.PingCompMultInput then isUpdatingUI = true; Options.PingCompMultInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    Glob:AddInput('PingCompMultInput', {Default = '1', Text = 'Precise Compensation Multiplier', Placeholder = 'e.g. 0.5 or 1', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.PingCompensationMultiplier = num
+            if not isUpdatingUI and Options.PingCompMult then isUpdatingUI = true; Options.PingCompMult:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+    Glob:AddSlider('PingCompMax', {Text = 'Max Compensation (seconds)', Default = 0.5, Min = 0, Max = 2, Rounding = 3, Callback = function(v)
+        getgenv().ParryConfig.PingCompensationMax = v
+        if not isUpdatingUI and Options.PingCompMaxInput then isUpdatingUI = true; Options.PingCompMaxInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    Glob:AddInput('PingCompMaxInput', {Default = '0.5', Text = 'Precise Max Compensation', Placeholder = 'e.g. 0.5', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.PingCompensationMax = num
+            if not isUpdatingUI and Options.PingCompMax then isUpdatingUI = true; Options.PingCompMax:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+
+    Glob:AddSlider('PingCompBase', {Text = 'Baseline Ping (ms)', Default = 0, Min = 0, Max = 500, Rounding = 0, Callback = function(v)
+        getgenv().ParryConfig.PingCompensationBaseline = v
+        if not isUpdatingUI and Options.PingCompBaseInput then isUpdatingUI = true; Options.PingCompBaseInput:SetValue(tostring(v)); isUpdatingUI = false end
+    end})
+    Glob:AddInput('PingCompBaseInput', {Default = '0', Text = 'Precise Baseline Ping', Placeholder = 'e.g. 60', Finished = true, Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            getgenv().ParryConfig.PingCompensationBaseline = num
+            if not isUpdatingUI and Options.PingCompBase then isUpdatingUI = true; Options.PingCompBase:SetValue(num); isUpdatingUI = false end
+        end
+    end})
+
+    Glob:AddSlider('PingCompLead', {Text = 'Extra Lead (ms)', Default = 0, Min = 0, Max = 200, Rounding = 0, Callback = function(v)
+        getgenv().ParryConfig.PingCompensationExtraLead = v
+    end})
+    Glob:AddSlider('PingCompGuard', {Text = 'Jitter Guard (ms)', Default = 50, Min = 0, Max = 200, Rounding = 0, Callback = function(v)
+        getgenv().ParryConfig.PingCompensationJitterGuard = v
+    end})
+    Glob:AddSlider('LateGrace', {Text = 'Late Reaction Grace (ms)', Default = 100, Min = 0, Max = 300, Rounding = 0, Callback = function(v)
+        getgenv().ParryConfig.LateReactionGrace = v
+    end})
+    Glob:AddToggle('FrameCorr', {Text = 'Frame Overhead Correction', Default = true, Callback = function(v) getgenv().ParryConfig.FrameOverheadCorrection = v end})
+
+    local PingReadout
+    local okPingReadout, pr = pcall(function() return Glob:AddLabel('Ping: -- ms | Comp: -- ms') end)
+    if okPingReadout then PingReadout = pr end
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if PingReadout then
+                local cfg = getgenv().ParryConfig
+                local mode = (cfg and cfg.PingCompensationMode) or 'Balanced'
+                pcall(function()
+                    PingReadout:SetText(string.format('Ping: %.0f ms | Jitter: %.0f ms | Comp: %.0f ms (%s) | Frame: %.0f ms', CachedPingMs, PingJitter, GetPingCompensation() * 1000, tostring(mode), GetFrameCorrection() * 1000))
+                end)
+            end
+        end
+    end)
 
     Glob:AddToggle('OnlyTarget', {Text = 'Only Parry Specific Player', Default = false, Callback = function(v) getgenv().ParryConfig.OnlyTargetPlayer = v end})
     Glob:AddInput('TargetName', {Default = '', Text = 'Target Player Name (exact)', Placeholder = 'e.g. Player1', Finished = true, Callback = function(v) getgenv().ParryConfig.TargetPlayerName = v end})
 
     local Cntr = Tabs.Combat:AddRightGroupbox('Counters')
     Cntr:AddToggle('CIP', {Text = 'Auto Counter', Default = false, Callback = function(v) getgenv().ParryConfig.CounterInsteadOfParry = v end})
-
-    Cntr:AddSlider('HCOUNTER', {
-        Text = 'Counter Chance (%)',
-        Default = 100, Min = 0, Max = 100, Rounding = 0,
-        Callback = function(v)
-            getgenv().ParryConfig.HumanizeCounterChance = v
-            UpdateHumanReadout()
-        end
-    })
-    Cntr:AddSlider('HMISSCOUNTER', {
-        Text = 'Missed Counter Chance (%)',
-        Default = 0, Min = 0, Max = 100, Rounding = 0,
-        Callback = function(v)
-            getgenv().ParryConfig.HumanizeMissedCounterChance = v
-            UpdateHumanReadout()
-        end
-    })
-
+    Cntr:AddSlider('HCOUNTER', {Text = 'Counter Chance (%)', Default = 100, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeCounterChance = v; UpdateHumanReadout() end})
+    Cntr:AddSlider('HMISSCOUNTER', {Text = 'Missed Counter Chance (%)', Default = 0, Min = 0, Max = 100, Rounding = 0, Callback = function(v) getgenv().ParryConfig.HumanizeMissedCounterChance = v; UpdateHumanReadout() end})
     Cntr:AddToggle('CAF', {Text = 'Counter Fallback', Default = false, Callback = function(v) getgenv().ParryConfig.CounterAsFallback = v end})
-    
     Cntr:AddSlider('CDO', {Text = 'Counter Delay Offset', Default = 0, Min = -1, Max = 1, Rounding = 3, Callback = function(v) 
         getgenv().ParryConfig.CounterDelayOffset = v 
-        if not isUpdatingUI and Options.CDOInput then
-            isUpdatingUI = true
-            Options.CDOInput:SetValue(tostring(v))
-            isUpdatingUI = false
-        end
+        if not isUpdatingUI and Options.CDOInput then isUpdatingUI = true; Options.CDOInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
     Cntr:AddInput('CDOInput', {Default = '0', Text = 'Precise Counter Delay Offset', Placeholder = 'e.g. -0.1', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
             getgenv().ParryConfig.CounterDelayOffset = num
-            if not isUpdatingUI and Options.CDO then
-                isUpdatingUI = true
-                Options.CDO:SetValue(num)
-                isUpdatingUI = false
-            end
+            if not isUpdatingUI and Options.CDO then isUpdatingUI = true; Options.CDO:SetValue(num); isUpdatingUI = false end
         end
     end})
 
     -- ==========================================
-    -- TAB 2: BUILDER (LEFT SIDE)
+    -- TAB 2: BUILDER
     -- ==========================================
     local BLeft1 = Tabs.Builder:AddLeftGroupbox('Logged Animations')
-    BLeft1:AddToggle('LAT', {Text = 'Enable Animation Logging', Default = true, Callback = function(v) loggingEnabled = v end})
+    BLeft1:AddToggle('LAT', {Text = 'Enable Animation Logging', Default = false, Callback = function(v) loggingEnabled = v end})
     BLeft1:AddToggle('LOA', {Text = 'Log My Own Animations', Default = false, Callback = function(v) getgenv().ParryConfig.LogOwnAnimations = v end})
     BLeft1:AddToggle('LDC', {Text = 'Enable Logger Distance Check', Default = false, Callback = function(v) getgenv().ParryConfig.LoggerDistanceCheck = v end})
     
     BLeft1:AddSlider('LMD', {Text = 'Logger Max Distance', Default = 50, Min = 5, Max = 200, Rounding = 0, Callback = function(v) 
         getgenv().ParryConfig.LoggerMaxDistance = v 
-        if not isUpdatingUI and Options.LMDInput then
-            isUpdatingUI = true
-            Options.LMDInput:SetValue(tostring(v))
-            isUpdatingUI = false
-        end
+        if not isUpdatingUI and Options.LMDInput then isUpdatingUI = true; Options.LMDInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
     BLeft1:AddInput('LMDInput', {Default = '50', Text = 'Precise Logger Max Distance', Placeholder = 'e.g. 100', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
             getgenv().ParryConfig.LoggerMaxDistance = num
-            if not isUpdatingUI and Options.LMD then
-                isUpdatingUI = true
-                Options.LMD:SetValue(num)
-                isUpdatingUI = false
-            end
+            if not isUpdatingUI and Options.LMD then isUpdatingUI = true; Options.LMD:SetValue(num); isUpdatingUI = false end
         end
     end})
 
     AnimDD = BLeft1:AddDropdown('LAL', {Values = {'No animations logged yet'}, Default = 1, Text = 'Detected Animations'})
-
     AnimDD:OnChanged(function(val)
         if not val then return end
         local id = animValueMap[val] or GetCleanAnimId(val)
@@ -1388,12 +1483,8 @@ local uiSuccess, uiErr = pcall(function()
         local v = TimingsDD.Value
         if not v or v == "None" then return Library:Notify("No timing selected.", 3) end
         local dec = LoadTimingFile(v)
-        if dec then
-            PopulateUIForEdit(dec.AnimId)
-            Library:Notify("Loaded '" .. v .. "' for editing.", 3)
-        else
-            Library:Notify("Failed to load timing.", 3)
-        end
+        if dec then PopulateUIForEdit(dec.AnimId); Library:Notify("Loaded '" .. v .. "' for editing.", 3)
+        else Library:Notify("Failed to load timing.", 3) end
     end)
     BLeft_Saved:AddButton('Reload All Timings', function() getgenv().ParryConfig.Profiles = {}; local n = LoadAllTimings(); pcall(RefreshAllDropdowns, true); Library:Notify("Reloaded " .. n .. " timings.", 3) end)
     BLeft_Saved:AddButton('Delete Selected File', function()
@@ -1407,12 +1498,8 @@ local uiSuccess, uiErr = pcall(function()
         local v = LoadedDD.Value
         if not v or v == "None" then return Library:Notify("None selected.", 3) end
         local id = loadedTimingMap[v] or v:match("%[(%d+)%]")
-        if id and getgenv().ParryConfig.Profiles[id] then
-            PopulateUIForEdit(id)
-            Library:Notify("Loaded '" .. v .. "' for editing.", 3)
-        else
-            Library:Notify("Timing not found in memory.", 3)
-        end
+        if id and getgenv().ParryConfig.Profiles[id] then PopulateUIForEdit(id); Library:Notify("Loaded '" .. v .. "' for editing.", 3)
+        else Library:Notify("Timing not found in memory.", 3) end
     end)
     BLeft_Active:AddButton('Unload Selected', function()
         local v = LoadedDD.Value; if not v or v == "None" then return Library:Notify("None selected.", 3) end
@@ -1428,20 +1515,46 @@ local uiSuccess, uiErr = pcall(function()
         RemoveBlacklist(v:match("%[(%d+)%]") or v); pcall(RefreshAllDropdowns, true); Library:Notify("Removed from blacklist.", 3)
     end)
     BLeft3:AddButton('Clear Entire Blacklist', function()
-        getgenv().ParryConfig.Blacklist = {}
-        SaveBlacklist()
-        pcall(RefreshAllDropdowns, true)
-        Library:Notify("Blacklist cleared successfully.", 3)
+        getgenv().ParryConfig.Blacklist = {}; SaveBlacklist(); pcall(RefreshAllDropdowns, true); Library:Notify("Blacklist cleared successfully.", 3)
     end)
 
-    -- ==========================================
-    -- TAB 2: BUILDER (RIGHT SIDE)
-    -- ==========================================
+    -- BUILDER RIGHT SIDE
     local BRight1 = Tabs.Builder:AddRightGroupbox('Timing Configuration')
     BRight1:AddInput('AnimIDInput', {Default = '', Text = 'Selected Animation ID', Placeholder = 'Select above or paste...', Callback = function(v) 
-        selAnimId = GetCleanAnimId(v) 
-        getgenv().ParryConfig.SelectedAnimId = selAnimId
+        selAnimId = GetCleanAnimId(v); getgenv().ParryConfig.SelectedAnimId = selAnimId
     end})
+    
+    local function SaveCurrentTiming(refreshDropdowns)
+        if selAnimId == "" then return false, "No Animation ID specified!" end
+        if saveName == "" then return false, "Press 'Set Timing Name' first to confirm a name!" end
+
+        if originalSaveName ~= "" and originalSaveName ~= saveName then DeleteTimingFile(originalSaveName) end
+
+        local hb = {
+            Size = currentHitbox.Size, Shape = currentHitbox.Shape,
+            ColorR = currentHitbox.ColorR, ColorG = currentHitbox.ColorG, ColorB = currentHitbox.ColorB,
+            Transparency = currentHitbox.Transparency
+        }
+
+        local ok, err = SaveTimingFile(saveName, selAnimId, currentPoints, hb)
+        if ok then
+            getgenv().ParryConfig.Profiles[selAnimId] = {Name = saveName, Points = currentPoints, Hitbox = hb, Enabled = true}
+            originalSaveName = saveName
+            if refreshDropdowns ~= false then
+                pcall(RefreshAllDropdowns, true)
+                if AnimDD then for disp, id in pairs(animValueMap) do if id == selAnimId then pcall(function() AnimDD:SetValue(disp) end); break end end end
+            end
+        end
+        return ok, err
+    end
+
+    -- MOVED: Save Timing to File
+    BRight1:AddButton('Save Timing to File', function()
+        local ok, err = SaveCurrentTiming(true)
+        if ok then Library:Notify("Saved timing '" .. saveName .. "' & loaded.", 3)
+        else Library:Notify("Error: " .. tostring(err), 4) end
+    end)
+
     BRight1:AddInput('TimingNameInput', {Default = '', Text = 'Timing Name', Placeholder = 'Type name, then press Set Timing Name...', Finished = true, Callback = function(v) end})
     BRight1:AddButton('Set Timing Name', function()
         if selAnimId == "" then return Library:Notify("Select an animation first!", 3) end
@@ -1457,40 +1570,21 @@ local uiSuccess, uiErr = pcall(function()
                 end
             end
         end
-
-        saveName = typed
-        Library:Notify("Timing name set to '" .. saveName .. "'. Now press 'Save Timing to File'.", 3)
+        saveName = typed; Library:Notify("Timing name set to '" .. saveName .. "'. Now press 'Save Timing to File'.", 3)
     end)
 
     BRight1:AddDropdown('ActionType', {Values = {'Parry', 'Roll'}, Default = 'Parry', Text = 'Point Action', Callback = function(v) selAction = v end})
-
     BRight1:AddSlider('ParryDelaySec', {Text = 'Point Trigger Delay (Seconds)', Default = 0.15, Min = 0, Max = 5, Rounding = 3, Callback = function(v)
         timingInput = v
-        if not isUpdatingTimingUI and Options.ParryDelayInput then
-            isUpdatingTimingUI = true
-            Options.ParryDelayInput:SetValue(tostring(v))
-            isUpdatingTimingUI = false
+        if not isUpdatingTimingUI and Options.ParryDelayInput then isUpdatingTimingUI = true; Options.ParryDelayInput:SetValue(tostring(v)); isUpdatingTimingUI = false end
+    end})
+    BRight1:AddInput('ParryDelayInput', {Default = '0.15', Numeric = false, Finished = true, Text = 'Precise Point Trigger Delay', Placeholder = 'e.g. 0.153', Callback = function(v)
+        local num = tonumber(v)
+        if num then
+            timingInput = num
+            if not isUpdatingTimingUI and Options.ParryDelaySec then isUpdatingTimingUI = true; Options.ParryDelaySec:SetValue(num); isUpdatingTimingUI = false end
         end
     end})
-
-    BRight1:AddInput('ParryDelayInput', {
-        Default = '0.15',
-        Numeric = false,
-        Finished = true,
-        Text = 'Precise Point Trigger Delay',
-        Placeholder = 'e.g. 0.153',
-        Callback = function(v)
-            local num = tonumber(v)
-            if num then
-                timingInput = num
-                if not isUpdatingTimingUI and Options.ParryDelaySec then
-                    isUpdatingTimingUI = true
-                    Options.ParryDelaySec:SetValue(num)
-                    isUpdatingTimingUI = false
-                end
-            end
-        end
-    })
 
     PointsDD = BRight1:AddDropdown('PointsList', {Values = {'No Points'}, Default = 1, Text = 'Reaction Points'})
     PointsDD:OnChanged(function(val)
@@ -1504,8 +1598,7 @@ local uiSuccess, uiErr = pcall(function()
                 if Options.ActionType then Options.ActionType:SetValue(pt.Action) end
                 if Options.ParryDelaySec then Options.ParryDelaySec:SetValue(pt.Delay) end
                 if Options.ParryDelayInput then Options.ParryDelayInput:SetValue(tostring(pt.Delay)) end
-                selAction = pt.Action
-                timingInput = pt.Delay
+                selAction = pt.Action; timingInput = pt.Delay
                 isUpdatingTimingUI = false
                 break
             end
@@ -1513,18 +1606,17 @@ local uiSuccess, uiErr = pcall(function()
     end)
 
     BRight1:AddButton('New Point', function()
-        local nextNum = #currentPoints + 1
-        local newName = "Point" .. nextNum
-        table.insert(currentPoints, {Name = newName, Action = "Parry", Delay = 0})
+        local newName = GetNextPointName()
+        local defaultDelay = timingInput or 0 -- Use the current precise delay
+        table.insert(currentPoints, {Name = newName, Action = "Parry", Delay = defaultDelay})
         RefreshPointsDropdown(newName)
         getgenv().ParryConfig.SelectedPointName = newName
         
         isUpdatingTimingUI = true
         if Options.ActionType then Options.ActionType:SetValue("Parry") end
-        if Options.ParryDelaySec then Options.ParryDelaySec:SetValue(0) end
-        if Options.ParryDelayInput then Options.ParryDelayInput:SetValue("0") end
-        selAction = "Parry"
-        timingInput = 0
+        if Options.ParryDelaySec then Options.ParryDelaySec:SetValue(defaultDelay) end
+        if Options.ParryDelayInput then Options.ParryDelayInput:SetValue(tostring(defaultDelay)) end
+        selAction = "Parry"; timingInput = defaultDelay
         isUpdatingTimingUI = false
     end)
 
@@ -1540,83 +1632,57 @@ local uiSuccess, uiErr = pcall(function()
             end
         end
         RefreshPointsDropdown(pName)
-        Library:Notify("Saved " .. pName .. " changes.", 3)
+
+        local ok, err = SaveCurrentTiming(false)
+        if ok then Library:Notify("Saved " .. pName .. " and updated the file.", 3)
+        else Library:Notify("Saved " .. pName .. " in memory (" .. tostring(err) .. ")", 4) end
+    end)
+
+    BRight1:AddButton('Delete Point', function()
+        local pName = getgenv().ParryConfig.SelectedPointName
+        if not pName or pName == "" then return Library:Notify("No point selected!", 3) end
+        
+        local found = false
+        for i = 1, #currentPoints do
+            if currentPoints[i].Name == pName then
+                table.remove(currentPoints, i)
+                found = true
+                break
+            end
+        end
+        if found then
+            RenumberPoints()
+            local keepName = currentPoints[1] and currentPoints[1].Name or ""
+            getgenv().ParryConfig.SelectedPointName = keepName
+            RefreshPointsDropdown(keepName)
+            SaveCurrentTiming(false)
+            Library:Notify("Deleted " .. pName, 3)
+        else Library:Notify("Point not found!", 3) end
     end)
 
     BRight1:AddToggle('DefendSelectedToggle', {Text = 'Defend Selected Timing', Default = false, Callback = function(v) getgenv().ParryConfig.DefendSelectedTimingEnabled = v end})
     BRight1:AddToggle('DefendSelectedPointToggle', {Text = 'Defend Selected Point', Default = false, Callback = function(v) getgenv().ParryConfig.DefendSelectedPointEnabled = v end})
 
     local BRight2 = Tabs.Builder:AddRightGroupbox('Hitbox Editor (Per-Animation)')
-
-    BRight2:AddDropdown('HitboxShape', {
-        Values = {'Cube', 'Sphere'},
-        Default = 'Cube',
-        Text = 'Hitbox Shape',
-        Callback = function(v)
-            if VALID_SHAPES[v] then
-                currentHitbox.Shape = v
-            end
-        end
-    })
-
+    BRight2:AddDropdown('HitboxShape', {Values = {'Cube', 'Sphere'}, Default = 'Cube', Text = 'Hitbox Shape', Callback = function(v) if VALID_SHAPES[v] then currentHitbox.Shape = v end end})
     BRight2:AddSlider('HitboxSize', {Text = 'Hitbox Size', Default = 25, Min = 0.1, Max = 100, Rounding = 2, Callback = function(v) 
         currentHitbox.Size = v 
-        if not isUpdatingUI and Options.HitboxSizeInput then
-            isUpdatingUI = true
-            Options.HitboxSizeInput:SetValue(tostring(v))
-            isUpdatingUI = false
-        end
+        if not isUpdatingUI and Options.HitboxSizeInput then isUpdatingUI = true; Options.HitboxSizeInput:SetValue(tostring(v)); isUpdatingUI = false end
     end})
     BRight2:AddInput('HitboxSizeInput', {Default = '25', Text = 'Precise Hitbox Size', Placeholder = 'e.g. 30', Finished = true, Callback = function(v)
         local num = tonumber(v)
         if num then
             currentHitbox.Size = num
-            if not isUpdatingUI and Options.HitboxSize then
-                isUpdatingUI = true
-                Options.HitboxSize:SetValue(num)
-                isUpdatingUI = false
-            end
+            if not isUpdatingUI and Options.HitboxSize then isUpdatingUI = true; Options.HitboxSize:SetValue(num); isUpdatingUI = false end
         end
     end})
-
     BRight2:AddSlider('HitboxTransparency', {Text = 'Visualizer Transparency', Default = 0.5, Min = 0, Max = 1, Rounding = 2, Callback = function(v) currentHitbox.Transparency = v end})
-
     local colorMap = {Red = {1, 0.2, 0.2}, Green = {0.2, 1, 0.2}, Blue = {0.2, 0.5, 1}, Yellow = {1, 1, 0.2}, Purple = {0.8, 0.2, 1}, Cyan = {0.2, 1, 1}, White = {1, 1, 1}}
     BRight2:AddDropdown('HitboxColor', {
         Values = {'Red', 'Green', 'Blue', 'Yellow', 'Purple', 'Cyan', 'White'}, Default = 'Red', Text = 'Visualizer Color',
         Callback = function(v) local c = colorMap[v]; if c then currentHitbox.ColorR, currentHitbox.ColorG, currentHitbox.ColorB = c[1], c[2], c[3] end end
     })
-
     BRight2:AddToggle('HitboxVisualizerToggle', {Text = 'Hitbox Visualizer', Default = false, Callback = function(v) if v then StartHitboxVisualizer() else StopHitboxVisualizer() end end})
-
-    BRight2:AddButton('Save Timing to File', function()
-        if selAnimId == "" then return Library:Notify("Error: No Animation ID specified!", 3) end
-        if saveName == "" then return Library:Notify("Error: Press 'Set Timing Name' first to confirm a name!", 4) end
-
-        if originalSaveName ~= "" and originalSaveName ~= saveName then
-            DeleteTimingFile(originalSaveName)
-        end
-
-        local hb = {
-            Size = currentHitbox.Size,
-            Shape = currentHitbox.Shape,
-            ColorR = currentHitbox.ColorR,
-            ColorG = currentHitbox.ColorG,
-            ColorB = currentHitbox.ColorB,
-            Transparency = currentHitbox.Transparency
-        }
-
-        local ok, err = SaveTimingFile(saveName, selAnimId, currentPoints, hb)
-        if ok then
-            getgenv().ParryConfig.Profiles[selAnimId] = {Name = saveName, Points = currentPoints, Hitbox = hb, Enabled = true}
-            originalSaveName = saveName
-            pcall(RefreshAllDropdowns, true)
-            if AnimDD then for disp, id in pairs(animValueMap) do if id == selAnimId then pcall(function() AnimDD:SetValue(disp) end); break end end end
-            Library:Notify("Saved timing '" .. saveName .. "' & loaded.", 3)
-        else
-            Library:Notify("Failed: " .. tostring(err), 3)
-        end
-    end)
 
     -- ==========================================
     -- TAB 3: SETTINGS
@@ -1634,56 +1700,27 @@ local uiSuccess, uiErr = pcall(function()
 
     local keySuccess = pcall(function()
         if Menu.AddKeyPicker then
-            local MenuKeybind = Menu:AddKeyPicker('MenuKeybind', {
-                Default = 'RightShift',
-                SyncToggleState = false,
-                Mode = 'Toggle',
-                Text = 'Toggle UI',
-                NoUI = false
-            })
+            local MenuKeybind = Menu:AddKeyPicker('MenuKeybind', {Default = 'RightShift', SyncToggleState = false, Mode = 'Toggle', Text = 'Toggle UI', NoUI = false})
             Library.ToggleKeybind = MenuKeybind
         elseif Menu.AddKeybind then
-            local MenuKeybind = Menu:AddKeybind('MenuKeybind', {
-                Default = 'RightShift',
-                SyncToggleState = false,
-                Mode = 'Toggle',
-                Text = 'Toggle UI',
-                NoUI = false
-            })
+            local MenuKeybind = Menu:AddKeybind('MenuKeybind', {Default = 'RightShift', SyncToggleState = false, Mode = 'Toggle', Text = 'Toggle UI', NoUI = false})
             Library.ToggleKeybind = MenuKeybind
-        else
-            error("AddKeyPicker missing")
-        end
+        else error("AddKeyPicker missing") end
     end)
 
     if not keySuccess then
-        Menu:AddInput('MenuKeybindFallback', {
-            Default = 'RightShift',
-            Text = 'Toggle UI Key',
-            Finished = true,
-            Placeholder = 'RightShift',
-            Callback = function() end
-        })
-        
+        Menu:AddInput('MenuKeybindFallback', {Default = 'RightShift', Text = 'Toggle UI Key', Finished = true, Placeholder = 'RightShift', Callback = function() end})
         UserInputService.InputBegan:Connect(function(input, gpe)
             if gpe then return end
             local currentKey = Options.MenuKeybindFallback and Options.MenuKeybindFallback.Value or "RightShift"
-            if input.KeyCode.Name == currentKey then
-                Library:Toggle()
-            end
+            if input.KeyCode.Name == currentKey then Library:Toggle() end
         end)
     end
 
-    -- BULLETPROOF CUSTOM CURSOR TOGGLE
     local cursorStateConn = nil
     local function UpdateCursorState(showCustom)
         Library.ShowCustomCursor = showCustom
-        
-        if cursorStateConn then
-            cursorStateConn:Disconnect()
-            cursorStateConn = nil
-        end
-        
+        if cursorStateConn then cursorStateConn:Disconnect(); cursorStateConn = nil end
         if not showCustom then
             UserInputService.MouseIconEnabled = true
             cursorStateConn = RunService.RenderStepped:Connect(function()
@@ -1691,9 +1728,7 @@ local uiSuccess, uiErr = pcall(function()
                 local function hideCursor(parent)
                     if not parent then return end
                     for _, v in ipairs(parent:GetDescendants()) do
-                        if v:IsA("ImageLabel") and v.Name == "Cursor" then
-                            v.Visible = false
-                        end
+                        if v:IsA("ImageLabel") and v.Name == "Cursor" then v.Visible = false end
                     end
                 end
                 hideCursor(Library.GUI)
@@ -1704,9 +1739,7 @@ local uiSuccess, uiErr = pcall(function()
             local function showCursor(parent)
                 if not parent then return end
                 for _, v in ipairs(parent:GetDescendants()) do
-                    if v:IsA("ImageLabel") and v.Name == "Cursor" then
-                        v.Visible = true
-                    end
+                    if v:IsA("ImageLabel") and v.Name == "Cursor" then v.Visible = true end
                 end
             end
             showCursor(Library.GUI)
@@ -1714,13 +1747,7 @@ local uiSuccess, uiErr = pcall(function()
         end
     end
 
-    Menu:AddToggle('CustomCursor', {
-        Text = 'Custom Cursor',
-        Default = true,
-        Callback = function(v)
-            UpdateCursorState(v)
-        end
-    })
+    Menu:AddToggle('CustomCursor', {Text = 'Custom Cursor', Default = true, Callback = function(v) UpdateCursorState(v) end})
 end)
 
 if not uiSuccess then
@@ -1776,9 +1803,6 @@ task.spawn(function() while true do task.wait(0.5); pcall(RefreshAllDropdowns) e
 Library:OnUnload(function() StopLocalCharacterAnimation(); StopHitboxVisualizer() end)
 Library:Notify("Evtariware Loaded! Auto-loaded " .. loadedCount .. " timing(s).", 5)
 
--- Autoload the most recent config
 pcall(function()
-    if SaveManager.LoadAutoloadConfig then
-        SaveManager:LoadAutoloadConfig()
-    end
+    if SaveManager.LoadAutoloadConfig then SaveManager:LoadAutoloadConfig() end
 end)
